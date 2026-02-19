@@ -52,6 +52,63 @@ MyriFetch is a modern, high-performance ROM manager and downloader designed spec
 4. Run the script: `./MyriFetch-macOS`.
 5. **Setup**: Go to **Settings** to map your console folders and enter your Twitch/RA API keys for the full experience.
 
+## 💿 CHDman Usage
+
+### Windows
+
+For safety and security reasons, this repository does not include the chdman.exe executable. Since you cannot always trust third-party binaries and repositories, it is best to download it yourself directly from the official source. This also ensures you get the most recent and compatible version.
+
+1. Go to the [official MAME tools download page](https://www.mamedev.org/release.html), download and install MAME.
+2. Go to the CHDman section in settings and select the path to CHDman (where you installed the tools to).
+3. Turn on compression per system (PS1, PS2, PSP and Dreamcast).
+
+### Linux
+
+On most distributions, `chdman` is bundled with the `mame-tools` package.
+
+**Method 1: Native Package Manager**
+
+1. Open your terminal.
+2. Run the command for your distribution:
+
+**Debian / Ubuntu / Linux Mint:**
+```bash
+sudo apt install mame-tools
+```
+
+**Arch Linux / Manjaro:**
+```bash
+sudo pacman -S mame-tools
+```
+
+**Fedora:**
+```bash
+sudo dnf install mame-tools
+```
+
+**Method 2: Homebrew (Alternative)**
+
+Alternatively, if you use Homebrew on Linux:
+
+1. Open Terminal.
+2. Run the following command:
+```bash
+brew install rom-tools
+```
+
+3. Once installed, the program should recognise where the executable is located.
+
+### MacOS
+
+On macOS, `chdman` is available through Homebrew in the `rom-tools` package.
+
+1. Open Terminal.
+2. Install Homebrew if you haven't already (https://brew.sh).
+3. Run the following command:
+```bash
+brew install rom-tools
+```
+
 ## 🏗️ Building from Source
 
 **Requirements**: Python 3.10+, pip
