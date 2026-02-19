@@ -18,6 +18,7 @@ import sys
 import re
 import webbrowser
 from datetime import datetime
+import zipfile
 
 # Windows sound import (conditional)
 try:
@@ -1211,6 +1212,54 @@ class UltimateApp(ctk.CTk):
         sep2.pack(fill='x', pady=10, padx=10)
         self.settings_widgets.append(sep2)
 
+        chd_header = ctk.CTkLabel(self.settings_scroll, text="CHDMAN COMPRESSION", font=('Arial', 14, 'bold'), text_color=C['cyan'])
+        chd_header.pack(fill='x', pady=(10, 5))
+        self.settings_widgets.append(chd_header)
+
+        chd_expl = ctk.CTkLabel(self.settings_scroll, text="Automatically compress ISO/BIN/CUE to CHD after download.", text_color=C['dim'], font=('Arial', 12))
+        chd_expl.pack(pady=(0, 10))
+        self.settings_widgets.append(chd_expl)
+
+        row_chd = ctk.CTkFrame(self.settings_scroll, fg_color='transparent')
+        row_chd.pack(fill='x', pady=2)
+        self.settings_widgets.append(row_chd)
+        
+        ctk.CTkLabel(row_chd, text="CHDMAN Path:", width=100, anchor='w').pack(side='left', padx=10)
+        self.entry_chdman = ctk.CTkEntry(row_chd, fg_color=C['bg'], border_color=C['dim'])
+        self.entry_chdman.insert(0, self.folder_mappings.get('chdman_path', ''))
+        self.entry_chdman.pack(side='left', fill='x', expand=True, padx=10)
+        self.entry_chdman.bind('<FocusOut>', lambda e: self.save_chd_settings(False))
+        self.entry_chdman.bind('<Return>', lambda e: self.save_chd_settings(False))
+        
+        btn_browse_chd = ctk.CTkButton(row_chd, text="Browse", width=60, fg_color=C['card'], command=self.browse_chdman)
+        btn_browse_chd.pack(side='right', padx=10)
+
+        self.chd_vars = {}
+        consoles = [('PlayStation 1', 'ps1'), ('PlayStation 2', 'ps2'), ('PSP', 'psp'), ('Dreamcast', 'dreamcast')]
+        
+        grid_frame = ctk.CTkFrame(self.settings_scroll, fg_color='transparent')
+        grid_frame.pack(fill='x', padx=10, pady=5)
+        self.settings_widgets.append(grid_frame)
+        
+        for i, (name, key_suffix) in enumerate(consoles):
+            key = f'use_chdman_{key_suffix}'
+            val = self.folder_mappings.get(key, False)
+            var = tk.BooleanVar(value=val)
+            self.chd_vars[key] = var
+            
+            r = i // 2
+            c = i % 2
+            
+            f = ctk.CTkFrame(grid_frame, fg_color='transparent')
+            f.grid(row=r, column=c, sticky='w', padx=10, pady=5)
+            
+            ctk.CTkLabel(f, text=name, width=100, anchor='w').pack(side='left')
+            ctk.CTkSwitch(f, text="", variable=var, command=lambda: self.save_chd_settings(False), progress_color=C['cyan']).pack(side='left')
+
+        sep3 = ctk.CTkFrame(self.settings_scroll, fg_color=C['dim'], height=1)
+        sep3.pack(fill='x', pady=10, padx=10)
+        self.settings_widgets.append(sep3)
+
         # TWITCH SECTION
         twitch_header = ctk.CTkLabel(self.settings_scroll, text="TWITCH / IGDB API (BOX ART & INFO)", font=('Arial', 14, 'bold'), text_color=C['cyan'])
         twitch_header.pack(fill='x', pady=(10, 5))
@@ -1278,6 +1327,23 @@ class UltimateApp(ctk.CTk):
         ctk.CTkLabel(ra_help, text="How to get RA key:", font=('Arial', 12, 'bold'), text_color=C['cyan']).pack(anchor='w', padx=10, pady=(10,5))
         ra_steps = ["1. Log in to RetroAchievements.org", "2. Go to My Pages > Settings", "3. Locate 'Web API Key' near the bottom of the page", "4. Copy and paste it here."]
         for s in ra_steps: ctk.CTkLabel(ra_help, text=s, font=('Arial', 11), anchor='w').pack(anchor='w', padx=15)
+
+    def browse_chdman(self):
+        path = filedialog.askopenfilename(title="Select chdman executable", filetypes=[("Executables", "*.exe"), ("All Files", "*.*")])
+        if path:
+            self.entry_chdman.delete(0, 'end')
+            self.entry_chdman.insert(0, path)
+            self.save_chd_settings(False)
+
+    def save_chd_settings(self, show_popup=False):
+        if hasattr(self, 'entry_chdman'):
+            self.folder_mappings['chdman_path'] = self.entry_chdman.get().strip()
+        if hasattr(self, 'chd_vars'):
+            for key, var in self.chd_vars.items():
+                self.folder_mappings[key] = var.get()
+        self.save_config()
+        if show_popup:
+            CustomPopup(self, "Success", "CHDMAN settings saved.", ["OK"])
 
     def toggle_notif_sound(self):
         self.folder_mappings['notif_sound'] = self.notif_var.get()
@@ -1617,6 +1683,15 @@ class UltimateApp(ctk.CTk):
 
         cache_map = {item['name']: item for item in self.file_cache}
         
+        console_type = None
+        for c_name, c_path in CONSOLES.items():
+            if self.current_path.startswith(c_path):
+                if c_name == 'PlayStation 1': console_type = 'ps1'
+                elif c_name == 'PlayStation 2': console_type = 'ps2'
+                elif c_name == 'PSP': console_type = 'psp'
+                elif c_name == 'Dreamcast': console_type = 'dreamcast'
+                break
+
         for name, href in targets:
             url = BASE_URL + self.current_path + href
             game_clean_name = os.path.splitext(name)[0]
@@ -1634,7 +1709,7 @@ class UltimateApp(ctk.CTk):
                         elif 'K' in raw_size: size_mb = val / 1024
                 except: size_mb = 0
                 
-            self.pending_stage_queue.append({'url': url, 'path': os.path.join(game_folder_path, name), 'name': name, 'size_mb': size_mb, 'folder': game_folder_path})
+            self.pending_stage_queue.append({'url': url, 'path': os.path.join(game_folder_path, name), 'name': name, 'size_mb': size_mb, 'folder': game_folder_path, 'console_type': console_type})
             
         self.show_queue()
         self.update_batch_labels()
@@ -1717,6 +1792,111 @@ class UltimateApp(ctk.CTk):
                 else: self.log("⚠ Art found but failed to download")
             except Exception as e: self.log(f"⚠ Art Error: {e}")
         else: self.log("⚠ No art found on IGDB")
+
+    def process_chd_compression(self, task, final_path):
+        c_type = task.get('console_type')
+        use_chd = self.folder_mappings.get(f'use_chdman_{c_type}', False)
+        chd_exe = self.folder_mappings.get('chdman_path')
+        
+        if not (use_chd and chd_exe and c_type):
+            return final_path
+
+        self.log("📦 Extracting for CHD compression...")
+        try:
+            extract_dir = task['folder']
+            if zipfile.is_zipfile(final_path):
+                with zipfile.ZipFile(final_path, 'r') as z: z.extractall(extract_dir)
+            
+            src_file, src_ext = None, None
+            files = os.listdir(extract_dir)
+            for ext in ['.gdi', '.cue', '.iso']:
+                for f in files:
+                    if f.lower().endswith(ext):
+                        src_file = os.path.join(extract_dir, f)
+                        src_ext = ext
+                        break
+                if src_file: break
+            
+            if src_file:
+                chd_out = os.path.splitext(src_file)[0] + ".chd"
+                modes = ['createdvd', 'createcd'] if src_ext == '.iso' else ['createcd']
+                success = False
+                last_err = ""
+                
+                si = None
+                if os.name == 'nt':
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+                self.after(0, lambda: self.lbl_speed.configure(text="Creating CHD..."))
+                self.after(0, lambda: self.progress_bar.set(0))
+                
+                for mode in modes:
+                    self.log(f"💿 Running CHDMAN ({mode})...")
+                    cmd = [chd_exe, mode, '-i', src_file, '-o', chd_out, '-f']
+                    
+                    full_log = []
+                    try:
+                        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si, text=True, bufsize=1)
+                        cur_line = ""
+                        while True:
+                            char = p.stdout.read(1)
+                            if not char and p.poll() is not None: break
+                            if char:
+                                cur_line += char
+                                if char in ('\r', '\n'):
+                                    line = cur_line.strip()
+                                    if line:
+                                        full_log.append(line)
+                                        match = re.search(r"(\d+(?:\.\d+)?)%", line)
+                                        if match:
+                                            try:
+                                                val = float(match.group(1))
+                                                self.after(0, lambda v=val: self.progress_bar.set(v/100))
+                                                self.after(0, lambda v=val: self.lbl_speed.configure(text=f"Creating CHD: {v:.1f}%"))
+                                            except: pass
+                                    cur_line = ""
+                        
+                        if p.returncode == 0 and os.path.exists(chd_out):
+                            success = True
+                            break
+                        last_err = "\n".join(full_log[-3:]) if full_log else "Unknown Error"
+                    except Exception as e:
+                        last_err = str(e)
+
+                if success:
+                    self.log("✔ Compression Successful")
+                    if os.path.exists(final_path): os.remove(final_path)
+                    for f in os.listdir(extract_dir):
+                        if os.path.join(extract_dir, f) != chd_out:
+                            try:
+                                p_item = os.path.join(extract_dir, f)
+                                if os.path.isfile(p_item): os.remove(p_item)
+                                else: shutil.rmtree(p_item)
+                            except: pass
+                    
+                    parent_dir = os.path.dirname(extract_dir)
+                    flat_path = os.path.join(parent_dir, os.path.basename(chd_out))
+                    if os.path.exists(flat_path): os.remove(flat_path)
+                    shutil.move(chd_out, flat_path)
+                    if not os.listdir(extract_dir): os.rmdir(extract_dir)
+                    return flat_path
+                else: 
+                    self.log(f"❌ CHDMAN Failed: {last_err}")
+                    if "unknown" in str(last_err).lower(): self.log("⚠ Tip: Update chdman to support 'createdvd'")
+                    if os.path.exists(chd_out): os.remove(chd_out)
+                    for f in os.listdir(extract_dir):
+                        p_item = os.path.join(extract_dir, f)
+                        try:
+                            if not os.path.samefile(p_item, final_path):
+                                if os.path.isfile(p_item): os.remove(p_item)
+                                else: shutil.rmtree(p_item)
+                        except: pass
+                    self.log("🧹 Extracted files cleaned up.")
+            else: self.log("⚠ No disc image found to compress.")
+        except Exception as e: self.log(f"❌ Compression Error: {e}")
+        
+        return final_path
 
     def process_queue(self):
         self.is_downloading = True
@@ -1839,6 +2019,7 @@ class UltimateApp(ctk.CTk):
                 if os.path.exists(final_path):
                     if os.path.getsize(final_path) < 2048: self.log("❌ FAILED: File too small (likely HTML error)")
                     else:
+                         final_path = self.process_chd_compression(task, final_path)
                          self.log("✔ COMPLETED")
                          if self.twitch.client_id:
                              save_dir = os.path.dirname(final_path)
