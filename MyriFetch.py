@@ -1226,7 +1226,10 @@ class UltimateApp(ctk.CTk):
         
         ctk.CTkLabel(row_chd, text="CHDMAN Path:", width=100, anchor='w').pack(side='left', padx=10)
         self.entry_chdman = ctk.CTkEntry(row_chd, fg_color=C['bg'], border_color=C['dim'])
-        self.entry_chdman.insert(0, self.folder_mappings.get('chdman_path', ''))
+        current_chd = self.folder_mappings.get('chdman_path', '')
+        if not current_chd and shutil.which('chdman'):
+            current_chd = shutil.which('chdman')
+        self.entry_chdman.insert(0, current_chd)
         self.entry_chdman.pack(side='left', fill='x', expand=True, padx=10)
         self.entry_chdman.bind('<FocusOut>', lambda e: self.save_chd_settings(False))
         self.entry_chdman.bind('<Return>', lambda e: self.save_chd_settings(False))
@@ -1798,6 +1801,9 @@ class UltimateApp(ctk.CTk):
         use_chd = self.folder_mappings.get(f'use_chdman_{c_type}', False)
         chd_exe = self.folder_mappings.get('chdman_path')
         
+        if not chd_exe and shutil.which('chdman'):
+            chd_exe = 'chdman'
+
         if not (use_chd and chd_exe and c_type):
             return final_path
 
@@ -2045,6 +2051,11 @@ if __name__ == '__main__':
     try:
         app = UltimateApp()
         app.mainloop()
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Critical Error", f"MyriFetch Crashed:\n\n{error_msg}")
     except Exception as e:
         error_msg = traceback.format_exc()
         root = tk.Tk()
