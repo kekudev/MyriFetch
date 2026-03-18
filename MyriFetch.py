@@ -2198,6 +2198,7 @@ class UltimateApp(ctk.CTk):
         for h in list(logger.handlers):
             logger.removeHandler(h)
             h.close()
+        logger.propagate = False  # prevent records leaking to root logger
         if enabled:
             logger.setLevel(logging.DEBUG)
             fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
