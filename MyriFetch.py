@@ -12,6 +12,7 @@ from PIL import Image
 import urllib3
 import shutil
 import traceback
+import logging
 import subprocess
 import platform
 import sys
@@ -45,6 +46,8 @@ else:
     APP_DATA = os.path.join(os.path.expanduser('~'), '.config', APP_NAME)
 
 os.makedirs(APP_DATA, exist_ok=True)
+
+LOG_FILE = os.path.join(APP_DATA, 'myrifetch_debug.log')
 
 # ---------------------------------------------------------------------------
 # Mappings
