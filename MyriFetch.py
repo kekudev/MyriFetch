@@ -1678,7 +1678,7 @@ class ScreenScraperManager:
             log(f'Saved: {dest_path}')
             return True
         except Exception as e:
-            log(f'Media download failed ({url}): {type(e).__name__}: {e}')
+            log(f'Media download failed ({_safe_url}): {type(e).__name__}: {e}')
             log(traceback.format_exc())
             return False
 
