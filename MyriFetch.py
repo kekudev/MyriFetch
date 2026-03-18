@@ -3679,6 +3679,7 @@ class UltimateApp(ctk.CTk):
             ("FILTER DEMOS", 'filter_demos', False),
             ("FILTER REVISIONS", 'filter_revs', False),
             ("GAME SUBFOLDERS", 'subfolder_per_game', True),
+            ("DEBUG LOGGING", 'debug_mode', False),
         ]:
             tr = _row(label)
             var = tk.BooleanVar(value=self.folder_mappings.get(key, default))
@@ -3688,6 +3689,27 @@ class UltimateApp(ctk.CTk):
                 command=lambda k=key, v=var: self._toggle_bool_setting(k, v),
                 progress_color=C['cyan']
             ).pack(side='left', padx=10)
+
+        # Open log file button (only shown when debug mode is on)
+        if self.folder_mappings.get('debug_mode', False):
+            def _open_log():
+                if os.path.exists(LOG_FILE):
+                    if os.name == 'nt':
+                        os.startfile(LOG_FILE)
+                    else:
+                        subprocess.Popen(['xdg-open', LOG_FILE])
+            log_row = _row("DEBUG LOG FILE", cyan=False)
+            ctk.CTkButton(
+                log_row, text="📋 Open Log",
+                fg_color=C['card'], hover_color=C['cyan'],
+                font=('Arial', 12), width=120,
+                command=_open_log
+            ).pack(side='left', padx=10)
+            ctk.CTkLabel(
+                log_row,
+                text=LOG_FILE, text_color=C['dim'], font=('Arial', 9)
+            ).pack(side='left', padx=5)
+            self.settings_widgets.append(log_row)
 
         sep = ctk.CTkFrame(self.settings_scroll, fg_color=C['dim'], height=1)
         sep.pack(fill='x', pady=10, padx=10)
@@ -4086,6 +4108,9 @@ class UltimateApp(ctk.CTk):
         self.save_config()
         if key in ('filter_demos', 'filter_revs'):
             self.filter_list()
+        if key == 'debug_mode':
+            self._setup_logging()
+            self.render_settings()  # refresh to show/hide the Open Log button
 
     def browse_chdman(self):
         path = filedialog.askopenfilename(
