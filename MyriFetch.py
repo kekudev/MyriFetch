@@ -2113,6 +2113,7 @@ class UltimateApp(ctk.CTk):
         self._cancel_event = threading.Event()   # SET = cancelled
         self._pause_event = threading.Event()    # SET = running (not paused)
         self._pause_event.set()                  # start in running state
+        self.is_downloading = False
         self.console_icons = {}
         self.current_page = 0
         self.items_per_page = 100
