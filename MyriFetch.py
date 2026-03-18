@@ -1597,14 +1597,21 @@ class ScreenScraperManager:
         params['systemeid'] = str(system_id)
         params['romnom'] = rom_name
 
+        # Sanitised URL for logging (no passwords)
+        safe_params = {k: v for k, v in params.items()
+                       if k not in ('devpassword', 'sspassword')}
+        log(f'ScreenScraper → GET systemeid={params["systemeid"]} romnom={params["romnom"]!r}')
+        log(f'  params (sanitised): {safe_params}')
         try:
             r = self._session.get(
                 self.SS_API, params=params, timeout=20
             )
+            log(f'  HTTP {r.status_code}')
             r.raise_for_status()
             data = r.json()
         except Exception as e:
             log(f'ScreenScraper API error: {type(e).__name__}: {e}')
+            log(traceback.format_exc())
             return None
 
         header = data.get('header', {})
@@ -1651,9 +1658,11 @@ class ScreenScraperManager:
                     log_cb(msg)
                 except Exception:
                     pass
+        log(f'ScreenScraper → downloading {url}')
         try:
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             r = self._session.get(url, timeout=30, stream=True)
+            log(f'  HTTP {r.status_code}')
             r.raise_for_status()
             with open(dest_path, 'wb') as f:
                 for chunk in r.iter_content(65536):
@@ -1662,6 +1671,7 @@ class ScreenScraperManager:
             return True
         except Exception as e:
             log(f'Media download failed ({url}): {type(e).__name__}: {e}')
+            log(traceback.format_exc())
             return False
 
     def scrape_game(
