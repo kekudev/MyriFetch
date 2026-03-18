@@ -2518,21 +2518,14 @@ class UltimateApp(ctk.CTk):
         self.render_home_grid()
 
         # Library
+        self.lib_sort_var = ctk.StringVar(value="All")
         self.lib_header = ctk.CTkFrame(self.frame_library, fg_color='transparent')
-        self.lib_header.pack(fill='x', pady=10)
+        self.lib_header.pack(fill='x', pady=(10, 4))
         ctk.CTkLabel(
             self.lib_header, text="GAME LIBRARY",
             font=('Arial', 20, 'bold'), text_color=C['cyan']
         ).pack(side='left')
-        self.lib_sort_var = ctk.StringVar(value="All Consoles")
-        self.lib_sort_menu = ctk.CTkOptionMenu(
-            self.lib_header, variable=self.lib_sort_var,
-            values=['All Consoles'], command=self.render_library_grid,
-            fg_color=C['card'], button_color=C['cyan'],
-            button_hover_color=C['pink'], text_color='white', width=160
-        )
-        self.lib_sort_menu.pack(side='right')
-        # Scrape all missing art button
+        # Scrape all missing art button (top-right)
         self.btn_scrape_all = ctk.CTkButton(
             self.lib_header, text="🎨 Scrape Missing Art",
             fg_color=C['card'], hover_color=C['pink'],
@@ -2540,6 +2533,9 @@ class UltimateApp(ctk.CTk):
             command=self.scrape_missing_art
         )
         self.btn_scrape_all.pack(side='right', padx=(0, 8))
+        # Horizontal tab bar for system filtering
+        self.lib_tab_frame = ctk.CTkFrame(self.frame_library, fg_color='transparent')
+        self.lib_tab_frame.pack(fill='x', pady=(0, 6))
         self.lib_scroll = ctk.CTkScrollableFrame(
             self.frame_library, fg_color=C['card']
         )
@@ -2896,6 +2892,7 @@ class UltimateApp(ctk.CTk):
         self.hide_all()
         self.frame_library.grid(row=1, column=0, sticky='nsew')
         self.btn_library.configure(fg_color=C['cyan'], text_color='black')
+        self._library_games = None  # force fresh scan on each visit
         self._load_library_async()
 
     def _load_library_async(self):
@@ -2921,6 +2918,7 @@ class UltimateApp(ctk.CTk):
 
         def _scan():
             games = self.scan_library()
+            self._library_games = games   # cache for tab switching
             self.after(0, lambda: self._render_library_with_games(games))
 
         threading.Thread(target=_scan, daemon=True).start()
@@ -3147,7 +3145,7 @@ class UltimateApp(ctk.CTk):
             '.wbfs', '.bin', '.nds', '.cia', '.gba', '.sfc', '.smc',
             '.parrot',
         )
-        found_consoles = {'All Consoles'}
+        found_consoles = set()
 
         # FIXED: only iterate known console paths, not all config keys
         for remote_path in CONSOLES.values():
@@ -3220,17 +3218,49 @@ class UltimateApp(ctk.CTk):
         sorted_consoles = sorted(found_consoles)
         # Safe to call from background thread — schedule on main thread
         self.after(0, lambda sc=sorted_consoles, cs=current_sort:
-            self._update_lib_sort_menu(sc, cs))
+            self._build_lib_tabs(sc, cs))
         return games
 
-    def _update_lib_sort_menu(self, sorted_consoles, current_sort):
-        self.lib_sort_menu.configure(values=sorted_consoles)
-        if current_sort not in sorted_consoles:
-            self.lib_sort_var.set("All Consoles")
+    def _build_lib_tabs(self, sorted_consoles, current_sort: str):
+        """Rebuild the horizontal system tab bar. Called on the main thread."""
+        for w in self.lib_tab_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        # Ensure "All" is always first
+        tabs = ['All'] + [c for c in sorted_consoles if c != 'All']
+        for label in tabs:
+            is_active = label == current_sort
+            btn = ctk.CTkButton(
+                self.lib_tab_frame, text=label,
+                fg_color=C['cyan'] if is_active else C['card'],
+                text_color='black' if is_active else 'white',
+                hover_color=C['pink'],
+                height=28, corner_radius=6, font=('Arial', 11),
+                command=lambda c=label: self._on_lib_tab_click(c)
+            )
+            btn.pack(side='left', padx=3, pady=3)
+
+    def _on_lib_tab_click(self, console: str):
+        """Switch the library view to the selected system tab without rescanning."""
+        self.lib_sort_var.set(console)
+        if self._library_games is not None:
+            # Re-render using the cache — no filesystem scan needed
+            self._build_lib_tabs(
+                sorted({g['console'] for g in self._library_games}),
+                console
+            )
+            self._render_library_with_games(self._library_games)
+        else:
+            self._load_library_async()
 
     def render_library_grid(self, _=None):
-        """Public entry point — always goes through the async loader."""
-        self._load_library_async()
+        """Re-render the grid. Uses cached games if available, else rescans."""
+        if self._library_games is not None:
+            self._render_library_with_games(self._library_games)
+        else:
+            self._load_library_async()
 
     def _render_library_with_games(self, games):
         """Called on the main thread with pre-scanned, pre-loaded game data."""
@@ -3244,7 +3274,7 @@ class UltimateApp(ctk.CTk):
         filter_console = self.lib_sort_var.get()
         filtered = [
             g for g in games
-            if filter_console == "All Consoles" or g['console'] == filter_console
+            if filter_console == "All" or g['console'] == filter_console
         ]
         if not filtered:
             lbl = ctk.CTkLabel(
