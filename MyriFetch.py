@@ -3160,8 +3160,6 @@ class UltimateApp(ctk.CTk):
                 if v == remote_path:
                     console_name = k
                     break
-            if console_name != "Unknown":
-                found_consoles.add(console_name)
 
             files_to_check = []
             try:
@@ -3208,6 +3206,7 @@ class UltimateApp(ctk.CTk):
                         except Exception:
                             pass
 
+                    found_consoles.add(console_name)
                     games.append({
                         'name': base_name, 'path': fpath,
                         'console': console_name, 'cover': img_path,
