@@ -3412,7 +3412,7 @@ class UltimateApp(ctk.CTk):
         config = self.folder_mappings
 
         def _fetch():
-            meta = ss.scrape_game(game, rom_dir, config)
+            meta = ss.scrape_game(game, rom_dir, config, log_cb=self._debug_log)
             success = bool(
                 meta.get('image') or meta.get('thumbnail') or meta.get('desc')
             )
