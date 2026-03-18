@@ -2105,6 +2105,9 @@ class UltimateApp(ctk.CTk):
         self.queue_widgets = []
         self.settings_widgets = []
         self.library_widgets = []
+        self._library_games = None   # cache – avoids rescan on tab switch
+        self._logger = None          # set up by _setup_logging()
+        self._setup_logging()
 
         self.tooltip_window = None
         self.tooltip_job = None
@@ -2186,6 +2189,33 @@ class UltimateApp(ctk.CTk):
     def save_config(self):
         # FIXED: atomic write — no data loss on crash
         _atomic_write_json(CONFIG_FILE, self.folder_mappings)
+
+    def _setup_logging(self):
+        """Configure (or tear down) the file logger based on the debug_mode setting."""
+        enabled = bool(self.folder_mappings.get('debug_mode', False))
+        logger = logging.getLogger('MyriFetch')
+        # Remove all existing handlers first to avoid duplicates on toggle
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+            h.close()
+        if enabled:
+            logger.setLevel(logging.DEBUG)
+            fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter(
+                '%(asctime)s  %(levelname)-8s  %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
+            logger.addHandler(fh)
+            logger.debug('--- Debug logging started ---')
+        else:
+            logger.setLevel(logging.CRITICAL)  # effectively silent
+        self._logger = logger
+
+    def _debug_log(self, msg: str):
+        """Write a debug message to the log file if debug mode is on."""
+        if self._logger:
+            self._logger.debug(msg)
 
     def apply_saved_theme(self):
         saved = self.folder_mappings.get('app_theme', 'Cyber Dark')
