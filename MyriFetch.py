@@ -7,7 +7,7 @@ import os
 import json
 import threading
 import time
-from urllib.parse import unquote, quote, urlparse
+from urllib.parse import unquote, quote, urlparse, parse_qs, urlencode, urlunparse
 from PIL import Image
 import urllib3
 import shutil
@@ -1597,9 +1597,9 @@ class ScreenScraperManager:
         params['systemeid'] = str(system_id)
         params['romnom'] = rom_name
 
-        # Sanitised URL for logging (no passwords)
+        # Sanitised URL for logging (no passwords or usernames)
         safe_params = {k: v for k, v in params.items()
-                       if k not in ('devpassword', 'sspassword')}
+                       if k not in ('devpassword', 'sspassword', 'devid', 'ssid')}
         log(f'ScreenScraper → GET systemeid={params["systemeid"]} romnom={params["romnom"]!r}')
         log(f'  params (sanitised): {safe_params}')
         try:
@@ -1658,7 +1658,15 @@ class ScreenScraperManager:
                     log_cb(msg)
                 except Exception:
                     pass
-        log(f'ScreenScraper → downloading {url}')
+        # Sanitise URL before logging — SS media URLs can embed sspassword in query string
+        try:
+            _p = urlparse(url)
+            _qs = {k: v for k, v in parse_qs(_p.query, keep_blank_values=True).items()
+                   if k not in ('sspassword', 'ssid', 'devpassword', 'devid')}
+            _safe_url = urlunparse(_p._replace(query=urlencode(_qs, doseq=True)))
+        except Exception:
+            _safe_url = '<url>'
+        log(f'ScreenScraper → downloading {_safe_url}')
         try:
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             r = self._session.get(url, timeout=30, stream=True)
