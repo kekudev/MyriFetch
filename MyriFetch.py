@@ -7,11 +7,12 @@ import os
 import json
 import threading
 import time
-from urllib.parse import unquote, quote, urlparse
+from urllib.parse import unquote, quote, urlparse, parse_qs, urlencode, urlunparse
 from PIL import Image
 import urllib3
 import shutil
 import traceback
+import logging
 import subprocess
 import platform
 import sys
@@ -45,6 +46,8 @@ else:
     APP_DATA = os.path.join(os.path.expanduser('~'), '.config', APP_NAME)
 
 os.makedirs(APP_DATA, exist_ok=True)
+
+LOG_FILE = os.path.join(APP_DATA, 'myrifetch_debug.log')
 
 # ---------------------------------------------------------------------------
 # Mappings
@@ -1468,6 +1471,374 @@ class TwitchManager:
 
 
 # ---------------------------------------------------------------------------
+# ScreenScraper integration
+# ---------------------------------------------------------------------------
+
+# ScreenScraper system IDs — maps MyriFetch console names to SS platform IDs
+SCREENSCRAPER_SYSTEM_IDS = {
+    # Sony
+    'PlayStation 1':  57,
+    'PlayStation 2':  58,
+    'PlayStation 3':  59,
+    'PSP':            61,
+    # Nintendo
+    'NES':                  3,
+    'SNES':                 4,
+    'N64':                  14,
+    'N64DD':                122,
+    'GameCube':             13,
+    'Wii':                  16,
+    'Wii U':                18,
+    'GBA':                  12,
+    'Game Boy':             9,
+    'Game Boy Color':       10,
+    'Nintendo DS':          15,
+    'Nintendo 3DS':         17,
+    'New Nintendo 3DS':     17,
+    'Virtual Boy':          11,
+    'Famicom Disk System':  106,
+    # Sega
+    'Mega Drive':    1,
+    'Master System': 2,
+    'Saturn':        22,
+    'Dreamcast':     23,
+    'Mega CD':       20,
+    'Game Gear':     21,
+    'Sega 32X':      19,
+    'SG-1000':       6,
+    # Microsoft
+    'Xbox':     32,
+    'Xbox 360': 33,
+    # SNK
+    'Neo Geo CD':           70,
+    'Neo Geo Pocket':       25,
+    'Neo Geo Pocket Color': 82,
+    # Atari
+    'Atari 2600':    26,
+    'Atari 5200':    40,
+    'Atari 7800':    41,
+    'Atari Lynx':    28,
+    'Atari Jaguar':  27,
+    'Atari Jaguar CD': 171,
+    # NEC
+    'PC Engine':    31,
+    'PC Engine SG': 105,
+    'PC Engine CD': 114,
+    'PC-FX':        72,
+    # Bandai
+    'WonderSwan':       45,
+    'WonderSwan Color': 46,
+    # Panasonic
+    '3DO': 29,
+    # Philips
+    'CD-i': 62,
+    # Commodore
+    'Amiga CD32': 130,
+    # Other
+    'ColecoVision': 48,
+    'Intellivision': 115,
+    'Vectrex':       102,
+    'MSX':           113,
+    'MSX2':          116,
+}
+
+# Reverse lookup: console_name → SS system ID (used from UltimateApp)
+CONSOLE_TO_SS_ID = SCREENSCRAPER_SYSTEM_IDS
+
+
+class ScreenScraperManager:
+    """
+    Wraps the ScreenScraper API (screenscraper.fr) to fetch game metadata
+    and download media assets matching your RetroBat ES configuration:
+
+      ScrapperImageSrc  = sstitle   → images/<name>-image.png
+      ScrapperThumbSrc  = box-3D    → <name>.jpg  (next to ROM, <thumbnail>)
+      + marquee                     → images/<name>-marquee.png
+      + video snap                  → videos/<name>-video.mp4
+    """
+
+    SS_API = 'https://www.screenscraper.fr/api2/jeuInfos.php'
+    SOFTNAME = 'MyriFetch'
+
+    # Priority region order for media selection
+    _REGION_PRIO = ['wor', 'us', 'en', 'eu', 'ss', 'uk', 'fr', 'de', 'jp']
+
+    def __init__(self, ss_user: str, ss_password: str):
+        self.ss_user = ss_user
+        self.ss_password = ss_password
+        self._session = requests.Session()
+        self._session.headers.update({
+            'User-Agent': f'MyriFetch/{APP_NAME}',
+        })
+
+    def _base_params(self):
+        return {
+            'devid':      self.ss_user,
+            'devpassword': self.ss_password,
+            'softname':   self.SOFTNAME,
+            'output':     'json',
+            'ssid':       self.ss_user,
+            'sspassword': self.ss_password,
+        }
+
+    def lookup_game(self, rom_name: str, system_id: int, log_cb=None):
+        """
+        Query ScreenScraper for a game by filename and system.
+        Returns the 'jeu' dict from the API or None.
+        """
+        def log(msg):
+            if log_cb:
+                try:
+                    log_cb(msg)
+                except Exception:
+                    pass
+
+        params = self._base_params()
+        params['systemeid'] = str(system_id)
+        params['romnom'] = rom_name
+
+        # Sanitised URL for logging (no passwords or usernames)
+        safe_params = {k: v for k, v in params.items()
+                       if k not in ('devpassword', 'sspassword', 'devid', 'ssid')}
+        log(f'ScreenScraper → GET systemeid={params["systemeid"]} romnom={params["romnom"]!r}')
+        log(f'  params (sanitised): {safe_params}')
+        try:
+            r = self._session.get(
+                self.SS_API, params=params, timeout=20
+            )
+            log(f'  HTTP {r.status_code}')
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            log(f'ScreenScraper API error: {type(e).__name__}: {e}')
+            log(traceback.format_exc())
+            return None
+
+        header = data.get('header', {})
+        if str(header.get('success', '')).lower() not in ('true', '1'):
+            err = header.get('error', 'unknown error')
+            log(f'ScreenScraper: {err}')
+            return None
+
+        jeu = (data.get('response') or {}).get('jeu')
+        if not jeu:
+            log(f'ScreenScraper: no game data returned for {rom_name!r}')
+            return None
+
+        log(f'ScreenScraper: matched "{_ss_pick_name(jeu)}"')
+        return jeu
+
+    def _find_media(self, jeu: dict, media_type: str) -> str | None:
+        """
+        Return the best download URL for a given media type, using
+        region priority order.  Returns None if not found.
+        """
+        medias = jeu.get('medias') or []
+        candidates = [m for m in medias if m.get('type') == media_type]
+        if not candidates:
+            return None
+        # Score by region priority
+        def _score(m):
+            region = str(m.get('region') or m.get('pays') or 'wor'
+                         ).lower().strip()
+            try:
+                return self._REGION_PRIO.index(region)
+            except ValueError:
+                return len(self._REGION_PRIO)
+        candidates.sort(key=_score)
+        return candidates[0].get('url')
+
+    def download_media(
+        self, url: str, dest_path: str, log_cb=None
+    ) -> bool:
+        """Download a media file to dest_path. Returns True on success."""
+        def log(msg):
+            if log_cb:
+                try:
+                    log_cb(msg)
+                except Exception:
+                    pass
+        # Sanitise URL before logging — SS media URLs can embed sspassword in query string
+        try:
+            _p = urlparse(url)
+            _qs = {k: v for k, v in parse_qs(_p.query, keep_blank_values=True).items()
+                   if k not in ('sspassword', 'ssid', 'devpassword', 'devid')}
+            _safe_url = urlunparse(_p._replace(query=urlencode(_qs, doseq=True)))
+        except Exception:
+            _safe_url = '<url>'
+        log(f'ScreenScraper → downloading {_safe_url}')
+        try:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            r = self._session.get(url, timeout=30, stream=True)
+            log(f'  HTTP {r.status_code}')
+            r.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                for chunk in r.iter_content(65536):
+                    f.write(chunk)
+            log(f'Saved: {dest_path}')
+            return True
+        except Exception as e:
+            log(f'Media download failed ({_safe_url}): {type(e).__name__}: {e}')
+            log(traceback.format_exc())
+            return False
+
+    def scrape_game(
+        self, game: dict, rom_dir: str, config: dict,
+        log_cb=None, progress_cb=None
+    ) -> dict:
+        """
+        Full scrape for one game entry.  Downloads all configured media types
+        and returns a metadata dict with keys:
+            image, thumbnail, marquee, video,
+            desc, genre, developer, publisher, releasedate, players, rating
+
+        Matches your es_settings.cfg:
+            ScrapperImageSrc = sstitle   → -image.png
+            ScrapperThumbSrc = box-3D    → .jpg next to ROM
+        """
+        def log(msg):
+            if log_cb:
+                try:
+                    log_cb(msg)
+                except Exception:
+                    pass
+
+        meta = {}
+        console_name = game.get('console', '')
+        system_id = CONSOLE_TO_SS_ID.get(console_name)
+        if not system_id:
+            log(f'ScreenScraper: no system ID for console {console_name!r}')
+            return meta
+
+        rom_name = os.path.basename(game.get('path', ''))
+        if not rom_name:
+            return meta
+
+        jeu = self.lookup_game(rom_name, system_id, log_cb=log)
+        if not jeu:
+            return meta
+
+        base_name = os.path.splitext(rom_name)[0]
+        images_dir = os.path.join(rom_dir, 'images')
+        videos_dir = os.path.join(rom_dir, 'videos')
+
+        steps = [
+            # (ss_media_type, dest_path, meta_key)
+            ('sstitle', os.path.join(images_dir, f'{base_name}-image.png'), 'image'),
+            ('box-3D',  os.path.join(rom_dir,    f'{base_name}.jpg'),       'thumbnail'),
+            ('marquee', os.path.join(images_dir, f'{base_name}-marquee.png'), 'marquee'),
+            ('video',   os.path.join(videos_dir, f'{base_name}-video.mp4'), 'video'),
+        ]
+
+        for idx, (media_type, dest, key) in enumerate(steps):
+            if progress_cb:
+                try:
+                    progress_cb(idx / len(steps))
+                except Exception:
+                    pass
+            url = self._find_media(jeu, media_type)
+            if url:
+                if self.download_media(url, dest, log_cb=log):
+                    meta[key] = dest
+            else:
+                log(f'ScreenScraper: no {media_type!r} media found')
+
+        if progress_cb:
+            try:
+                progress_cb(1.0)
+            except Exception:
+                pass
+
+        # ---- Text metadata ----
+        lang = str(config.get('language', 'en')).lower()[:2]
+        meta['desc']        = _ss_pick_text(jeu.get('synopsis') or [], lang)
+        meta['genre']       = _ss_pick_genres(jeu)
+        meta['developer']   = _ss_pick_company(jeu, 'developpeur')
+        meta['publisher']   = _ss_pick_company(jeu, 'editeur')
+        meta['releasedate'] = _ss_pick_date(jeu)
+        meta['players']     = str(jeu.get('joueurs') or '')
+        meta['rating']      = _ss_pick_rating(jeu)
+
+        return meta
+
+
+# --- ScreenScraper helper functions ---
+
+def _ss_pick_name(jeu: dict) -> str:
+    noms = jeu.get('noms') or []
+    for region in ('wor', 'us', 'eu', 'jp', 'ss'):
+        for n in noms:
+            if str(n.get('region') or '').lower() == region:
+                return n.get('text', '')
+    return (noms[0].get('text', '') if noms else
+            jeu.get('romnom', 'Unknown'))
+
+
+def _ss_pick_text(items: list, lang: str) -> str:
+    """Pick best synopsis/text for the given language."""
+    if not items:
+        return ''
+    # Prefer exact language match, fall back to 'en'
+    for target in (lang, 'en', 'fr'):
+        for item in items:
+            if str(item.get('langue') or item.get('language') or '').lower() == target:
+                return (item.get('text') or item.get('synop') or '').strip()
+    # Any
+    first = items[0]
+    return (first.get('text') or first.get('synop') or '').strip()
+
+
+def _ss_pick_genres(jeu: dict) -> str:
+    genres = jeu.get('genres') or []
+    names = []
+    for g in genres[:3]:
+        noms = g.get('noms') or []
+        name = _ss_pick_text(noms, 'en')
+        if name:
+            names.append(name)
+    return ', '.join(names)
+
+
+def _ss_pick_company(jeu: dict, key: str) -> str:
+    company = jeu.get(key) or {}
+    noms = company.get('noms') or []
+    if noms:
+        return noms[0].get('text', '')
+    return str(company.get('text') or company.get('nom') or '')
+
+
+def _ss_pick_date(jeu: dict) -> str:
+    """Return ES-format date string: YYYYMMDDTHHMMSS"""
+    dates = jeu.get('dates') or {}
+    for region in ('wor', 'us', 'eu', 'jp'):
+        d = dates.get(region, '')
+        if d:
+            # SS format varies: YYYY-MM-DD or YYYY or YYYY-MM
+            d = d.strip()
+            d_clean = d.replace('-', '')
+            if len(d_clean) == 8:
+                return f'{d_clean}T000000'
+            if len(d_clean) == 4:
+                return f'{d_clean}0101T000000'
+            if len(d_clean) == 6:
+                return f'{d_clean}01T000000'
+    return ''
+
+
+def _ss_pick_rating(jeu: dict) -> str:
+    """Return ES rating 0.0-1.0 as string."""
+    note = jeu.get('note') or ''
+    try:
+        # SS note is typically 0-20
+        v = float(str(note).replace(',', '.'))
+        if v > 1:
+            v = v / 20.0
+        return f'{max(0.0, min(1.0, v)):.2f}'
+    except (ValueError, TypeError):
+        return ''
+
+
+# ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
 
@@ -1714,7 +2085,7 @@ class UltimateApp(ctk.CTk):
         self.apply_saved_theme()
         super().__init__()
 
-        self.app_version = "1.4.2"
+        self.app_version = "1.4.1"
         self.github_url = "https://github.com/crabbiemike/MyriFetch"
 
         self.twitch = TwitchManager(
@@ -1752,6 +2123,9 @@ class UltimateApp(ctk.CTk):
         self.queue_widgets = []
         self.settings_widgets = []
         self.library_widgets = []
+        self._library_games = None   # cache – avoids rescan on tab switch
+        self._logger = None          # set up by _setup_logging()
+        self._setup_logging()
 
         self.tooltip_window = None
         self.tooltip_job = None
@@ -1797,9 +2171,70 @@ class UltimateApp(ctk.CTk):
         else:
             self.folder_mappings = {}
 
+        # Auto-migrate ScreenScraper credentials from RetroBat's es_settings.cfg
+        # if they haven't been saved to MyriFetch config yet.
+        if not self.folder_mappings.get('ss_user'):
+            self._try_import_ss_creds_from_retrobat()
+
+    def _try_import_ss_creds_from_retrobat(self):
+        """
+        If the user hasn't set SS credentials yet, silently read them from
+        RetroBat's es_settings.cfg (ScreenScraperUser / ScreenScraperPass).
+        """
+        try:
+            rb_path = self.folder_mappings.get('retrobat_path', r'C:\retrobat')
+            cfg_path = os.path.join(
+                rb_path, 'emulationstation', '.emulationstation', 'es_settings.cfg'
+            )
+            if not os.path.isfile(cfg_path):
+                return
+            tree = ET.parse(cfg_path)
+            root = tree.getroot()
+            user = pass_ = ''
+            for el in root.findall('string'):
+                name = el.get('name', '')
+                value = el.get('value', '')
+                if name == 'ScreenScraperUser':
+                    user = value.strip()
+                elif name == 'ScreenScraperPass':
+                    pass_ = value.strip()
+            if user and pass_:
+                self.folder_mappings['ss_user'] = user
+                self.folder_mappings['ss_password'] = pass_
+        except Exception:
+            pass
+
     def save_config(self):
         # FIXED: atomic write — no data loss on crash
         _atomic_write_json(CONFIG_FILE, self.folder_mappings)
+
+    def _setup_logging(self):
+        """Configure (or tear down) the file logger based on the debug_mode setting."""
+        enabled = bool(self.folder_mappings.get('debug_mode', False))
+        logger = logging.getLogger('MyriFetch')
+        # Remove all existing handlers first to avoid duplicates on toggle
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+            h.close()
+        logger.propagate = False  # prevent records leaking to root logger
+        if enabled:
+            logger.setLevel(logging.DEBUG)
+            fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter(
+                '%(asctime)s  %(levelname)-8s  %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
+            logger.addHandler(fh)
+            logger.debug('--- Debug logging started ---')
+        else:
+            logger.setLevel(logging.CRITICAL)  # effectively silent
+        self._logger = logger
+
+    def _debug_log(self, msg: str):
+        """Write a debug message to the log file if debug mode is on."""
+        if self._logger:
+            self._logger.debug(msg)
 
     def apply_saved_theme(self):
         saved = self.folder_mappings.get('app_theme', 'Cyber Dark')
@@ -2083,21 +2518,14 @@ class UltimateApp(ctk.CTk):
         self.render_home_grid()
 
         # Library
+        self.lib_sort_var = ctk.StringVar(value="All")
         self.lib_header = ctk.CTkFrame(self.frame_library, fg_color='transparent')
-        self.lib_header.pack(fill='x', pady=10)
+        self.lib_header.pack(fill='x', pady=(10, 4))
         ctk.CTkLabel(
             self.lib_header, text="GAME LIBRARY",
             font=('Arial', 20, 'bold'), text_color=C['cyan']
         ).pack(side='left')
-        self.lib_sort_var = ctk.StringVar(value="All Consoles")
-        self.lib_sort_menu = ctk.CTkOptionMenu(
-            self.lib_header, variable=self.lib_sort_var,
-            values=['All Consoles'], command=self.render_library_grid,
-            fg_color=C['card'], button_color=C['cyan'],
-            button_hover_color=C['pink'], text_color='white', width=160
-        )
-        self.lib_sort_menu.pack(side='right')
-        # Scrape all missing art button
+        # Scrape all missing art button (top-right)
         self.btn_scrape_all = ctk.CTkButton(
             self.lib_header, text="🎨 Scrape Missing Art",
             fg_color=C['card'], hover_color=C['pink'],
@@ -2105,6 +2533,9 @@ class UltimateApp(ctk.CTk):
             command=self.scrape_missing_art
         )
         self.btn_scrape_all.pack(side='right', padx=(0, 8))
+        # Horizontal tab bar for system filtering
+        self.lib_tab_frame = ctk.CTkFrame(self.frame_library, fg_color='transparent')
+        self.lib_tab_frame.pack(fill='x', pady=(0, 6))
         self.lib_scroll = ctk.CTkScrollableFrame(
             self.frame_library, fg_color=C['card']
         )
@@ -2461,6 +2892,7 @@ class UltimateApp(ctk.CTk):
         self.hide_all()
         self.frame_library.grid(row=1, column=0, sticky='nsew')
         self.btn_library.configure(fg_color=C['cyan'], text_color='black')
+        self._library_games = None  # force fresh scan on each visit
         self._load_library_async()
 
     def _load_library_async(self):
@@ -2486,6 +2918,7 @@ class UltimateApp(ctk.CTk):
 
         def _scan():
             games = self.scan_library()
+            self._library_games = games   # cache for tab switching
             self.after(0, lambda: self._render_library_with_games(games))
 
         threading.Thread(target=_scan, daemon=True).start()
@@ -2712,7 +3145,7 @@ class UltimateApp(ctk.CTk):
             '.wbfs', '.bin', '.nds', '.cia', '.gba', '.sfc', '.smc',
             '.parrot',
         )
-        found_consoles = {'All Consoles'}
+        found_consoles = set()
 
         # FIXED: only iterate known console paths, not all config keys
         for remote_path in CONSOLES.values():
@@ -2727,8 +3160,6 @@ class UltimateApp(ctk.CTk):
                 if v == remote_path:
                     console_name = k
                     break
-            if console_name != "Unknown":
-                found_consoles.add(console_name)
 
             files_to_check = []
             try:
@@ -2775,6 +3206,7 @@ class UltimateApp(ctk.CTk):
                         except Exception:
                             pass
 
+                    found_consoles.add(console_name)
                     games.append({
                         'name': base_name, 'path': fpath,
                         'console': console_name, 'cover': img_path,
@@ -2785,17 +3217,49 @@ class UltimateApp(ctk.CTk):
         sorted_consoles = sorted(found_consoles)
         # Safe to call from background thread — schedule on main thread
         self.after(0, lambda sc=sorted_consoles, cs=current_sort:
-            self._update_lib_sort_menu(sc, cs))
+            self._build_lib_tabs(sc, cs))
         return games
 
-    def _update_lib_sort_menu(self, sorted_consoles, current_sort):
-        self.lib_sort_menu.configure(values=sorted_consoles)
-        if current_sort not in sorted_consoles:
-            self.lib_sort_var.set("All Consoles")
+    def _build_lib_tabs(self, sorted_consoles, current_sort: str):
+        """Rebuild the horizontal system tab bar. Called on the main thread."""
+        for w in self.lib_tab_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        # Ensure "All" is always first
+        tabs = ['All'] + [c for c in sorted_consoles if c != 'All']
+        for label in tabs:
+            is_active = label == current_sort
+            btn = ctk.CTkButton(
+                self.lib_tab_frame, text=label,
+                fg_color=C['cyan'] if is_active else C['card'],
+                text_color='black' if is_active else 'white',
+                hover_color=C['pink'],
+                height=28, corner_radius=6, font=('Arial', 11),
+                command=lambda c=label: self._on_lib_tab_click(c)
+            )
+            btn.pack(side='left', padx=3, pady=3)
+
+    def _on_lib_tab_click(self, console: str):
+        """Switch the library view to the selected system tab without rescanning."""
+        self.lib_sort_var.set(console)
+        if self._library_games is not None:
+            # Re-render using the cache — no filesystem scan needed
+            self._build_lib_tabs(
+                sorted({g['console'] for g in self._library_games}),
+                console
+            )
+            self._render_library_with_games(self._library_games)
+        else:
+            self._load_library_async()
 
     def render_library_grid(self, _=None):
-        """Public entry point — always goes through the async loader."""
-        self._load_library_async()
+        """Re-render the grid. Uses cached games if available, else rescans."""
+        if self._library_games is not None:
+            self._render_library_with_games(self._library_games)
+        else:
+            self._load_library_async()
 
     def _render_library_with_games(self, games):
         """Called on the main thread with pre-scanned, pre-loaded game data."""
@@ -2809,7 +3273,7 @@ class UltimateApp(ctk.CTk):
         filter_console = self.lib_sort_var.get()
         filtered = [
             g for g in games
-            if filter_console == "All Consoles" or g['console'] == filter_console
+            if filter_console == "All" or g['console'] == filter_console
         ]
         if not filtered:
             lbl = ctk.CTkLabel(
@@ -2871,77 +3335,22 @@ class UltimateApp(ctk.CTk):
                 )
                 scrape_btn.pack(fill='x', padx=5, pady=(0, 5))
                 self.library_widgets.append(scrape_btn)
-        """
-        Fetch cover art from IGDB for a single game dict and save it as a .jpg
-        alongside the ROM file. Calls done_cb() on the main thread when finished
-        (success or failure) so the caller can refresh the UI.
-        """
-        twitch_id = str(self.folder_mappings.get('twitch_id', '')).strip()
-        twitch_secret = str(self.folder_mappings.get('twitch_secret', '')).strip()
-        if not twitch_id or not twitch_secret:
-            CustomPopup(
-                self, "No IGDB Credentials",
-                "Twitch/IGDB credentials are required for art scraping.\n"
-                "Add them in Settings → API Keys.", ["OK"]
-            )
-            return
-
-        def _fetch():
-            clean_name = game['name'].split('(')[0].split('[')[0].strip()
-            clean_name = clean_name.replace('"', '').replace(';', '').strip()
-            if not clean_name:
-                self.after(0, lambda: done_cb and done_cb(False))
-                return
-
-            game_data = TwitchManager(twitch_id, twitch_secret).search_game(clean_name)
-            if not isinstance(game_data, dict):
-                self.after(0, lambda: done_cb and done_cb(False))
-                return
-
-            cover_info = game_data.get('cover') or {}
-            raw_url = cover_info.get('url')
-            if not raw_url:
-                self.after(0, lambda: done_cb and done_cb(False))
-                return
-
-            if raw_url.startswith('//'):
-                raw_url = 'https:' + raw_url
-            hq_url = raw_url.replace('t_thumb', 't_cover_big')
-
-            try:
-                r = requests.get(hq_url, timeout=15)
-                if r.status_code != 200:
-                    self.after(0, lambda: done_cb and done_cb(False))
-                    return
-                rom_base = os.path.splitext(os.path.basename(game['path']))[0]
-                save_path = os.path.join(
-                    os.path.dirname(game['path']), rom_base + '.jpg'
-                )
-                with open(save_path, 'wb') as f:
-                    f.write(r.content)
-                game['cover'] = save_path
-                self.after(0, lambda: done_cb and done_cb(True))
-            except Exception:
-                self.after(0, lambda: done_cb and done_cb(False))
-
-        threading.Thread(target=_fetch, daemon=True).start()
 
     def scrape_missing_art(self):
-        """Scrape IGDB art for every library game that has no cover image."""
-        twitch_id = str(self.folder_mappings.get('twitch_id', '')).strip()
-        twitch_secret = str(self.folder_mappings.get('twitch_secret', '')).strip()
-        if not twitch_id or not twitch_secret:
+        """Scrape ScreenScraper media for every library game that has no cover image."""
+        ss = self._get_ss_manager()
+        if not ss:
             CustomPopup(
-                self, "No IGDB Credentials",
-                "Twitch/IGDB credentials are required for art scraping.\n"
-                "Add them in Settings → API Keys.", ["OK"]
+                self, "No ScreenScraper Credentials",
+                "ScreenScraper username and password are required.\n"
+                "Add them in Settings → ScreenScraper.", ["OK"]
             )
             return
 
         confirm = CustomPopup(
             self, "Scrape Missing Art",
             "Scan library and fetch cover art for all games without art?\n\n"
-            "This uses IGDB and may take a while.",
+            "This uses ScreenScraper and may take a while.",
             ["Scrape", "Cancel"]
         )
         if confirm.result != "Scrape":
@@ -3000,9 +3409,137 @@ class UltimateApp(ctk.CTk):
             )
         self.render_library_grid()
 
+    def _get_ss_manager(self) -> ScreenScraperManager | None:
+        """Return a configured ScreenScraperManager or None if not set up."""
+        ss_user = str(self.folder_mappings.get('ss_user', '')).strip()
+        ss_pass = str(self.folder_mappings.get('ss_password', '')).strip()
+        if not ss_user or not ss_pass:
+            return None
+        return ScreenScraperManager(ss_user, ss_pass)
+
     def scrape_game_art(self, game, done_cb=None):
-        """Scrape art for one game card and refresh just that card on completion."""
-        # Disable the button immediately so the user doesn't double-click
+        """
+        Fetch media and metadata from ScreenScraper for a single game.
+        Saves:
+          - sstitle  → images/<n>-image.png  (<image>)
+          - box-3D   → <n>.jpg next to ROM   (<thumbnail>)
+          - marquee  → images/<n>-marquee.png
+          - video    → videos/<n>-video.mp4
+        Updates gamelist.xml with all metadata tags.
+        Calls done_cb(success: bool) on the main thread when finished.
+        """
+        ss = self._get_ss_manager()
+        if not ss:
+            CustomPopup(
+                self, "No ScreenScraper Credentials",
+                "ScreenScraper username and password are required.\n"
+                "Add them in Settings → ScreenScraper.", ["OK"]
+            )
+            return
+
+        rom_dir = os.path.dirname(game.get('path', ''))
+        config = self.folder_mappings
+
+        def _fetch():
+            meta = ss.scrape_game(game, rom_dir, config, log_cb=self._debug_log)
+            success = bool(
+                meta.get('image') or meta.get('thumbnail') or meta.get('desc')
+            )
+            if success and meta.get('thumbnail'):
+                game['cover'] = meta['thumbnail']
+            if success:
+                self._writeback_scraped_meta(game, rom_dir, meta)
+            self.after(0, lambda: done_cb and done_cb(success))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _writeback_scraped_meta(
+        self, game: dict, rom_dir: str, meta: dict
+    ) -> bool:
+        """
+        Update gamelist.xml with full scraped metadata:
+        <image>, <thumbnail>, <marquee>, <video>,
+        <desc>, <genre>, <developer>, <publisher>,
+        <releasedate>, <players>, <rating>.
+        """
+        gamelist_path = os.path.join(rom_dir, 'gamelist.xml')
+        if not os.path.isfile(gamelist_path):
+            return False
+        try:
+            tree = ET.parse(gamelist_path)
+            root = tree.getroot()
+        except Exception:
+            return False
+
+        rom_base = os.path.splitext(
+            os.path.basename(game.get('path', ''))
+        )[0].lower()
+
+        updated = False
+        for game_el in root.findall('game'):
+            path_el = game_el.find('path')
+            if path_el is None:
+                continue
+            entry_base = os.path.splitext(
+                os.path.basename((path_el.text or '').lstrip('./\\'))
+            )[0].lower()
+            if entry_base != rom_base:
+                continue
+
+            tag_map = {
+                'image':       meta.get('image'),
+                'thumbnail':   meta.get('thumbnail'),
+                'marquee':     meta.get('marquee'),
+                'video':       meta.get('video'),
+                'desc':        meta.get('desc'),
+                'genre':       meta.get('genre'),
+                'developer':   meta.get('developer'),
+                'publisher':   meta.get('publisher'),
+                'releasedate': meta.get('releasedate'),
+                'players':     meta.get('players'),
+                'rating':      meta.get('rating'),
+            }
+            for tag, value in tag_map.items():
+                if not value:
+                    continue
+                if os.path.isabs(str(value)):
+                    try:
+                        rel = os.path.relpath(value, rom_dir)
+                        value = './' + rel.replace('\\', '/')
+                    except ValueError:
+                        pass
+                el = game_el.find(tag)
+                if el is None:
+                    el = ET.SubElement(game_el, tag)
+                el.text = str(value)
+
+            # Remove stub genre if a real genre was scraped
+            if meta.get('genre'):
+                for g_el in game_el.findall('genre'):
+                    if (g_el.text or '').strip().lower() == 'available to download':
+                        game_el.remove(g_el)
+                        break
+
+            updated = True
+            break
+
+        if not updated:
+            return False
+
+        tmp = gamelist_path + '.tmp'
+        try:
+            tree.write(tmp, encoding='utf-8', xml_declaration=True)
+            os.replace(tmp, gamelist_path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+        return True
+
+    def _scrape_single_and_refresh(self, game, card):
+        """Scrape art for one game card and refresh the library on completion."""
         for w in card.winfo_children():
             if isinstance(w, ctk.CTkButton) and 'Scrape' in (w.cget('text') or ''):
                 w.configure(text="Scraping...", state='disabled')
@@ -3012,12 +3549,11 @@ class UltimateApp(ctk.CTk):
             if success:
                 self.render_library_grid()
             else:
-                # Re-enable button with failure message, then restore
                 for w in card.winfo_children():
                     if isinstance(w, ctk.CTkButton) and 'Scraping' in (w.cget('text') or ''):
                         w.configure(text="Not found", state='disabled',
                                     text_color=C['pink'])
-                        self.after(2000, lambda: w.configure(
+                        self.after(2000, lambda btn=w: btn.configure(
                             text="🎨 Scrape Art", state='normal',
                             text_color=C['dim']
                         ))
@@ -3190,6 +3726,7 @@ class UltimateApp(ctk.CTk):
             ("FILTER DEMOS", 'filter_demos', False),
             ("FILTER REVISIONS", 'filter_revs', False),
             ("GAME SUBFOLDERS", 'subfolder_per_game', True),
+            ("DEBUG LOGGING", 'debug_mode', False),
         ]:
             tr = _row(label)
             var = tk.BooleanVar(value=self.folder_mappings.get(key, default))
@@ -3199,6 +3736,26 @@ class UltimateApp(ctk.CTk):
                 command=lambda k=key, v=var: self._toggle_bool_setting(k, v),
                 progress_color=C['cyan']
             ).pack(side='left', padx=10)
+
+        # Open log file
+        def _open_log():
+            if os.path.exists(LOG_FILE):
+                if os.name == 'nt':
+                    os.startfile(LOG_FILE)
+                else:
+                    subprocess.Popen(['xdg-open', LOG_FILE])
+        log_row = _row("DEBUG LOG FILE", cyan=False)
+        ctk.CTkButton(
+            log_row, text="📋 Open Log",
+            fg_color=C['card'], hover_color=C['cyan'],
+            font=('Arial', 12), width=120,
+            command=_open_log
+        ).pack(side='left', padx=10)
+        ctk.CTkLabel(
+            log_row,
+            text=LOG_FILE, text_color=C['dim'], font=('Arial', 9)
+        ).pack(side='left', padx=5)
+        self.settings_widgets.append(log_row)
 
         sep = ctk.CTkFrame(self.settings_scroll, fg_color=C['dim'], height=1)
         sep.pack(fill='x', pady=10, padx=10)
@@ -3357,6 +3914,47 @@ class UltimateApp(ctk.CTk):
         sep4 = ctk.CTkFrame(self.settings_scroll, fg_color=C['dim'], height=1)
         sep4.pack(fill='x', pady=10, padx=10)
         self.settings_widgets.append(sep4)
+
+        # --- ScreenScraper ---
+        ctk.CTkLabel(
+            self.settings_scroll, text="SCREENSCRAPER",
+            font=('Arial', 14, 'bold'), text_color=C['cyan']
+        ).pack(fill='x', pady=(10, 2))
+        ctk.CTkLabel(
+            self.settings_scroll,
+            text="Used for scraping media (box art, screenshots, video, metadata).\n"
+                 "Register free at screenscraper.fr — same account you use in RetroBat.",
+            font=('Arial', 11), text_color=C['dim'], justify='left'
+        ).pack(fill='x', padx=10, pady=(0, 6))
+        for label, attr, key, show in [
+            ("Username:", 'entry_ss_user',     'ss_user',     ''),
+            ("Password:", 'entry_ss_password', 'ss_password', '*'),
+        ]:
+            r = ctk.CTkFrame(self.settings_scroll, fg_color='transparent')
+            r.pack(fill='x', pady=2)
+            self.settings_widgets.append(r)
+            ctk.CTkLabel(r, text=label, width=100, anchor='w').pack(
+                side='left', padx=10
+            )
+            entry = ctk.CTkEntry(
+                r, fg_color=C['bg'], border_color=C['dim'], show=show
+            )
+            entry.insert(0, self.folder_mappings.get(key, ''))
+            entry.pack(side='left', fill='x', expand=True, padx=10)
+            setattr(self, attr, entry)
+
+        btn_ss = ctk.CTkButton(
+            self.settings_scroll,
+            text="Save ScreenScraper Credentials",
+            fg_color=C['cyan'], text_color='black',
+            command=self.save_ss_creds
+        )
+        btn_ss.pack(pady=10)
+        self.settings_widgets.append(btn_ss)
+
+        sep5 = ctk.CTkFrame(self.settings_scroll, fg_color=C['dim'], height=1)
+        sep5.pack(fill='x', pady=10, padx=10)
+        self.settings_widgets.append(sep5)
 
         ctk.CTkLabel(
             self.settings_scroll, text="RETROBAT INTEGRATION",
@@ -3556,6 +4154,8 @@ class UltimateApp(ctk.CTk):
         self.save_config()
         if key in ('filter_demos', 'filter_revs'):
             self.filter_list()
+        if key == 'debug_mode':
+            self._setup_logging()
 
     def browse_chdman(self):
         path = filedialog.askopenfilename(
@@ -3673,6 +4273,36 @@ class UltimateApp(ctk.CTk):
         self.ra.username = self.folder_mappings['ra_user']
         self.ra.api_key = self.folder_mappings['ra_key']
         CustomPopup(self, "Success", "RetroAchievements keys saved.", ["OK"])
+
+    def save_ss_creds(self):
+        ss_user = self.entry_ss_user.get().strip()
+        ss_pass = self.entry_ss_password.get().strip()
+        self.folder_mappings['ss_user'] = ss_user
+        self.folder_mappings['ss_password'] = ss_pass
+        self.save_config()
+        if ss_user and ss_pass:
+            # Quick connectivity test
+            def _test():
+                try:
+                    ss = ScreenScraperManager(ss_user, ss_pass)
+                    # Lightweight call — just check the user info endpoint
+                    r = ss._session.get(
+                        'https://www.screenscraper.fr/api2/ssuserInfos.php',
+                        params=ss._base_params(), timeout=10
+                    )
+                    ok = r.status_code == 200
+                    msg = "ScreenScraper credentials saved and verified ✔" if ok else \
+                          "Credentials saved, but could not verify (check username/password)."
+                    self.after(0, lambda: CustomPopup(
+                        self, "ScreenScraper", msg, ["OK"]
+                    ))
+                except Exception as e:
+                    self.after(0, lambda err=str(e): CustomPopup(
+                        self, "ScreenScraper", f"Saved, but verification failed:\n{err}", ["OK"]
+                    ))
+            threading.Thread(target=_test, daemon=True).start()
+        else:
+            CustomPopup(self, "Saved", "ScreenScraper credentials cleared.", ["OK"])
 
     def _save_retrobat_path(self):
         if hasattr(self, 'entry_retrobat_path'):
@@ -4683,7 +5313,7 @@ class UltimateApp(ctk.CTk):
             except Exception as e:
                 self.log(f"⚠ Art Error: {e}")
         else:
-            self.log("⚠ No art found on IGDB")
+            self.log("⚠ No art found on ScreenScraper")
 
     def process_chd_compression(self, task, final_path):
         c_type = task.get('console_type')
@@ -5748,52 +6378,152 @@ class DownloadPopup(ctk.CTk):
         self.after(0, _do)
 
     def _download_cover_art(self, downloaded_path):
-        twitch_id = str(self.config.get('twitch_id', '')).strip()
-        twitch_secret = str(self.config.get('twitch_secret', '')).strip()
-        if not twitch_id or not twitch_secret:
+        """
+        Fetch artwork via ScreenScraper right after a game is downloaded.
+        Saves box-3D thumbnail next to the ROM and writes gamelist.xml tags.
+        """
+        ss_user = str(self.config.get('ss_user', '')).strip()
+        ss_pass = str(self.config.get('ss_password', '')).strip()
+        if not ss_user or not ss_pass:
+            self._log_popup_event('Artwork skipped: no ScreenScraper credentials')
+            return
+
+        console_name = self.console_type or ''
+        system_id = CONSOLE_TO_SS_ID.get(console_name)
+        if not system_id:
             self._log_popup_event(
-                'Artwork skipped: Twitch/IGDB credentials are not configured'
+                f'Artwork skipped: no ScreenScraper system ID for {console_name!r}'
             )
             return
 
-        base_name = os.path.splitext(self.rom_name or '')[0]
-        clean_name = base_name.split('(')[0].split('[')[0].strip()
-        clean_name = clean_name.replace('"', '').replace(';', '').strip()
-        if not clean_name:
-            self._log_popup_event('Artwork skipped: empty cleaned game name')
-            return
+        target_path = downloaded_path or os.path.join(
+            self.dest_dir, self.rom_name or ''
+        )
+        rom_basename = os.path.basename(target_path)
+        base_name    = os.path.splitext(rom_basename)[0]
+        rom_dir      = os.path.dirname(target_path) or self.dest_dir
 
-        self._log_popup_event(f'Artwork lookup: {clean_name}')
-        game_data = TwitchManager(twitch_id, twitch_secret).search_game(clean_name)
-        if not isinstance(game_data, dict):
-            self._log_popup_event('Artwork not found on IGDB')
-            return
-
-        cover_info = game_data.get('cover') or {}
-        raw_url = cover_info.get('url')
-        if not raw_url:
-            self._log_popup_event('Artwork not found on IGDB')
-            return
-
-        if raw_url.startswith('//'):
-            raw_url = 'https:' + raw_url
-        hq_url = raw_url.replace('t_thumb', 't_cover_big')
-
+        self._log_popup_event(f'Artwork lookup (ScreenScraper): {rom_basename}')
         try:
-            r = requests.get(hq_url, timeout=15)
-            if r.status_code != 200:
-                self._log_popup_event(f'Artwork download failed: HTTP {r.status_code}')
+            ss  = ScreenScraperManager(ss_user, ss_pass)
+            jeu = ss.lookup_game(rom_basename, system_id,
+                                 log_cb=self._log_popup_event)
+            if not jeu:
+                self._log_popup_event('Artwork: game not found on ScreenScraper')
                 return
 
-            target_base = os.path.splitext(
-                os.path.basename(downloaded_path or self.rom_name)
-            )[0]
-            save_path = os.path.join(self.dest_dir, target_base + '.jpg')
-            with open(save_path, 'wb') as f:
-                f.write(r.content)
-            self._log_popup_event(f'Artwork saved: {save_path}')
+            # box-3D → thumbnail next to ROM (matches your es_settings.cfg)
+            images_dir = os.path.join(rom_dir, 'images')
+            videos_dir = os.path.join(rom_dir, 'videos')
+            steps = [
+                ('box-3D',  os.path.join(rom_dir,    f'{base_name}.jpg')),
+                ('sstitle', os.path.join(images_dir, f'{base_name}-image.png')),
+                ('marquee', os.path.join(images_dir, f'{base_name}-marquee.png')),
+                ('video',   os.path.join(videos_dir, f'{base_name}-video.mp4')),
+            ]
+            meta = {}
+            for media_type, dest in steps:
+                url = ss._find_media(jeu, media_type)
+                if url and ss.download_media(url, dest,
+                                             log_cb=self._log_popup_event):
+                    meta[{
+                        'box-3D':  'thumbnail',
+                        'sstitle': 'image',
+                        'marquee': 'marquee',
+                        'video':   'video',
+                    }[media_type]] = dest
+
+            # Text metadata
+            lang = str(self.config.get('language', 'en')).lower()[:2]
+            meta.update({
+                'desc':        _ss_pick_text(jeu.get('synopsis') or [], lang),
+                'genre':       _ss_pick_genres(jeu),
+                'developer':   _ss_pick_company(jeu, 'developpeur'),
+                'publisher':   _ss_pick_company(jeu, 'editeur'),
+                'releasedate': _ss_pick_date(jeu),
+                'players':     str(jeu.get('joueurs') or ''),
+                'rating':      _ss_pick_rating(jeu),
+            })
+
+            # Write to gamelist.xml
+            game_stub = {'path': target_path, 'name': base_name,
+                         'console': console_name}
+            self._writeback_scraped_meta_popup(game_stub, rom_dir, meta)
+
         except Exception as e:
-            self._log_popup_event(f'Artwork download error: {type(e).__name__}: {e}')
+            self._log_popup_event(
+                f'Artwork error: {type(e).__name__}: {e}'
+            )
+
+    def _writeback_scraped_meta_popup(
+        self, game: dict, rom_dir: str, meta: dict
+    ) -> None:
+        """Write ScreenScraper metadata to gamelist.xml from DownloadPopup context."""
+        gamelist_path = os.path.join(rom_dir, 'gamelist.xml')
+        if not os.path.isfile(gamelist_path):
+            return
+        try:
+            tree = ET.parse(gamelist_path)
+            root = tree.getroot()
+        except Exception:
+            return
+
+        rom_base = os.path.splitext(
+            os.path.basename(game.get('path', ''))
+        )[0].lower()
+
+        for game_el in root.findall('game'):
+            path_el = game_el.find('path')
+            if path_el is None:
+                continue
+            entry_base = os.path.splitext(
+                os.path.basename((path_el.text or '').lstrip('./\\'))
+            )[0].lower()
+            if entry_base != rom_base:
+                continue
+
+            tag_map = {
+                'image':       meta.get('image'),
+                'thumbnail':   meta.get('thumbnail'),
+                'marquee':     meta.get('marquee'),
+                'video':       meta.get('video'),
+                'desc':        meta.get('desc'),
+                'genre':       meta.get('genre'),
+                'developer':   meta.get('developer'),
+                'publisher':   meta.get('publisher'),
+                'releasedate': meta.get('releasedate'),
+                'players':     meta.get('players'),
+                'rating':      meta.get('rating'),
+            }
+            for tag, value in tag_map.items():
+                if not value:
+                    continue
+                if os.path.isabs(str(value)):
+                    try:
+                        rel = os.path.relpath(value, rom_dir)
+                        value = './' + rel.replace('\\', '/')
+                    except ValueError:
+                        pass
+                el = game_el.find(tag)
+                if el is None:
+                    el = ET.SubElement(game_el, tag)
+                el.text = str(value)
+            if meta.get('genre'):
+                for g_el in game_el.findall('genre'):
+                    if (g_el.text or '').strip().lower() == 'available to download':
+                        game_el.remove(g_el)
+                        break
+            break
+
+        tmp = gamelist_path + '.tmp'
+        try:
+            tree.write(tmp, encoding='utf-8', xml_declaration=True)
+            os.replace(tmp, gamelist_path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def _run_download(self):
         success = False

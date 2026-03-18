@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.spec
+
+# Logs & runtime files
+*.log
+*.json.corrupt
+
+# IDE & editor
+.vscode/
+.idea/
+
+# Claude & tooling internals
+.claude/
+.superpowers/
+
+# Project-local subdirs not for VCS
+retrobat/
+conductor/
+
+# Misc dev artifacts
+latestgeminicliseshtxt.txt
+myrifetch140to141.json
