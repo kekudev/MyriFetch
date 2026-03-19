@@ -4234,6 +4234,9 @@ class UltimateApp(ctk.CTk):
         for k, v in CONSOLES.items():
             if v == remote_path:
                 short = SHORT_NAMES.get(k, k)
+                # Don't re-append if the user already picked the console folder
+                if os.path.basename(base_path).lower() == short.lower():
+                    return base_path
                 final = os.path.join(base_path, short)
                 try:
                     os.makedirs(final, exist_ok=True)
@@ -4323,9 +4326,10 @@ class UltimateApp(ctk.CTk):
             if not rb_folder:
                 continue
             rom_dir = os.path.join(roms_base, rb_folder)
-            if os.path.isdir(rom_dir):
-                self.folder_mappings[myrient_path] = rom_dir
-                mapped += 1
+            # Map all known consoles, even if folder doesn't exist yet —
+            # scan_library skips missing paths, and downloads will create them.
+            self.folder_mappings[myrient_path] = rom_dir
+            mapped += 1
         self.save_config()
         self.render_settings()
         CustomPopup(self, "RetroBat Detected", f"Auto-mapped {mapped} console folders.", ["OK"])
