@@ -1555,17 +1555,28 @@ class ScreenScraperManager:
       ScrapperThumbSrc  = box-3D    → <name>.jpg  (next to ROM, <thumbnail>)
       + marquee                     → images/<name>-marquee.png
       + video snap                  → videos/<name>-video.mp4
+
+    Authentication requires TWO separate credential pairs:
+      - devid / devpassword  → registered developer credentials for MyriFetch
+      - ssid / sspassword    → the end-user's ScreenScraper account
     """
 
-    SS_API = 'https://www.screenscraper.fr/api2/jeuInfos.php'
+    SS_API = 'https://api.screenscraper.fr/api2/jeuInfos.php'
+    SS_USER_API = 'https://api.screenscraper.fr/api2/ssuserInfos.php'
     SOFTNAME = 'MyriFetch'
 
     # Priority region order for media selection
     _REGION_PRIO = ['wor', 'us', 'en', 'eu', 'ss', 'uk', 'fr', 'de', 'jp']
 
-    def __init__(self, ss_user: str, ss_password: str):
+    def __init__(self, ss_user: str, ss_password: str,
+                 dev_id: str = '', dev_password: str = ''):
         self.ss_user = ss_user
         self.ss_password = ss_password
+        # Developer credentials — separate from user creds per SS API spec.
+        # If not provided, falls back to user creds (works for users who have
+        # registered their own dev account).
+        self.dev_id = dev_id or ss_user
+        self.dev_password = dev_password or ss_password
         self._session = requests.Session()
         self._session.headers.update({
             'User-Agent': f'MyriFetch/{APP_NAME}',
@@ -1573,12 +1584,12 @@ class ScreenScraperManager:
 
     def _base_params(self):
         return {
-            'devid':      self.ss_user,
-            'devpassword': self.ss_password,
-            'softname':   self.SOFTNAME,
-            'output':     'json',
-            'ssid':       self.ss_user,
-            'sspassword': self.ss_password,
+            'devid':       self.dev_id,
+            'devpassword': self.dev_password,
+            'softname':    self.SOFTNAME,
+            'output':      'json',
+            'ssid':        self.ss_user,
+            'sspassword':  self.ss_password,
         }
 
     def lookup_game(self, rom_name: str, system_id: int, log_cb=None):
@@ -1610,8 +1621,16 @@ class ScreenScraperManager:
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            log(f'ScreenScraper API error: {type(e).__name__}: {e}')
-            log(traceback.format_exc())
+            # Sanitise error messages — strip credentials from URLs
+            err_msg = str(e)
+            tb_msg = traceback.format_exc()
+            for secret_key in ('devpassword', 'sspassword', 'devid', 'ssid'):
+                secret_val = params.get(secret_key, '')
+                if secret_val:
+                    err_msg = err_msg.replace(secret_val, '***')
+                    tb_msg = tb_msg.replace(secret_val, '***')
+            log(f'ScreenScraper API error: {type(e).__name__}: {err_msg}')
+            log(tb_msg)
             return None
 
         header = data.get('header', {})
@@ -2125,6 +2144,7 @@ class UltimateApp(ctk.CTk):
         self.settings_widgets = []
         self.library_widgets = []
         self._library_games = None   # cache – avoids rescan on tab switch
+        self._scraping_paths = set() # guard against duplicate scrape requests
         self._logger = None          # set up by _setup_logging()
         self._setup_logging()
 
@@ -2520,27 +2540,59 @@ class UltimateApp(ctk.CTk):
 
         # Library
         self.lib_sort_var = ctk.StringVar(value="All")
+        self._lib_search_var = ctk.StringVar(value="")
+
+        # -- Top row: title + action buttons
         self.lib_header = ctk.CTkFrame(self.frame_library, fg_color='transparent')
-        self.lib_header.pack(fill='x', pady=(10, 4))
+        self.lib_header.pack(fill='x', padx=12, pady=(10, 0))
         ctk.CTkLabel(
             self.lib_header, text="GAME LIBRARY",
             font=('Arial', 20, 'bold'), text_color=C['cyan']
         ).pack(side='left')
-        # Scrape all missing art button (top-right)
+        # Refresh button — rescan without leaving the page
+        self._lib_refresh_btn = ctk.CTkButton(
+            self.lib_header, text="↻ Refresh", width=90,
+            fg_color=C['card'], hover_color=C['pink'],
+            font=('Arial', 11), height=28, corner_radius=6,
+            command=self._lib_force_refresh
+        )
+        self._lib_refresh_btn.pack(side='right', padx=(6, 0))
         self.btn_scrape_all = ctk.CTkButton(
             self.lib_header, text="🎨 Scrape Missing Art",
             fg_color=C['card'], hover_color=C['pink'],
-            font=('Arial', 12), width=170,
+            font=('Arial', 11), width=160, height=28, corner_radius=6,
             command=self.scrape_missing_art
         )
-        self.btn_scrape_all.pack(side='right', padx=(0, 8))
-        # Horizontal tab bar for system filtering
-        self.lib_tab_frame = ctk.CTkFrame(self.frame_library, fg_color='transparent')
-        self.lib_tab_frame.pack(fill='x', pady=(0, 6))
-        self.lib_scroll = ctk.CTkScrollableFrame(
-            self.frame_library, fg_color=C['card']
+        self.btn_scrape_all.pack(side='right', padx=(6, 0))
+        # -- Search bar
+        self._lib_search_entry = ctk.CTkEntry(
+            self.lib_header, placeholder_text="Search games...",
+            textvariable=self._lib_search_var, width=200, height=28,
+            fg_color=C['card'], border_color=C['dim'], corner_radius=6,
+            font=('Arial', 11)
         )
-        self.lib_scroll.pack(fill='both', expand=True)
+        self._lib_search_entry.pack(side='right', padx=(6, 0))
+        self._lib_search_var.trace_add('write', lambda *_: self._on_lib_search())
+
+        # -- Scrollable tab bar for system filtering (handles overflow)
+        self.lib_tab_frame = ctk.CTkScrollableFrame(
+            self.frame_library, fg_color='transparent',
+            orientation='horizontal', height=38
+        )
+        self.lib_tab_frame.pack(fill='x', padx=12, pady=(6, 4))
+
+        # -- Game count label
+        self._lib_count_lbl = ctk.CTkLabel(
+            self.frame_library, text="",
+            font=('Arial', 10), text_color=C['dim']
+        )
+        self._lib_count_lbl.pack(fill='x', padx=16, pady=(0, 2), anchor='w')
+
+        # -- Main scrollable game grid
+        self.lib_scroll = ctk.CTkScrollableFrame(
+            self.frame_library, fg_color=C['bg']
+        )
+        self.lib_scroll.pack(fill='both', expand=True, padx=4, pady=(0, 4))
         self.bind_scroll(self.lib_scroll, self.lib_scroll)
 
         # Browser
@@ -2683,10 +2735,23 @@ class UltimateApp(ctk.CTk):
             font=('Consolas', 12), height=100
         )
         self.log_box.pack(fill='x', pady=(0, 10))
+        # Queue header with search
+        _q_header = ctk.CTkFrame(self.frame_queue, fg_color='transparent')
+        _q_header.pack(fill='x', pady=(10, 4))
         ctk.CTkLabel(
-            self.frame_queue, text="PENDING QUEUE",
+            _q_header, text="DOWNLOAD QUEUE",
             font=('Arial', 20, 'bold'), text_color=C['dim']
-        ).pack(anchor='w', pady=10)
+        ).pack(side='left')
+        self._queue_search_var = ctk.StringVar(value='')
+        _q_search = ctk.CTkEntry(
+            _q_header, placeholder_text="Search queue...",
+            textvariable=self._queue_search_var, width=200, height=28,
+            fg_color=C['card'], border_color=C['dim'], corner_radius=6,
+            font=('Arial', 11)
+        )
+        _q_search.pack(side='right', padx=(6, 0))
+        self._queue_search_var.trace_add(
+            'write', lambda *_: self.render_queue_list())
         self.queue_list_frame = ctk.CTkScrollableFrame(
             self.frame_queue, fg_color=C['card']
         )
@@ -2893,8 +2958,21 @@ class UltimateApp(ctk.CTk):
         self.hide_all()
         self.frame_library.grid(row=1, column=0, sticky='nsew')
         self.btn_library.configure(fg_color=C['cyan'], text_color='black')
-        self._library_games = None  # force fresh scan on each visit
+        if self._library_games is not None:
+            # Use cached data — just re-render (instant tab switch)
+            self._render_library_with_games(self._library_games)
+        else:
+            self._load_library_async()
+
+    def _lib_force_refresh(self):
+        """User clicked Refresh — clear cache and rescan."""
+        self._library_games = None
         self._load_library_async()
+
+    def _on_lib_search(self):
+        """Re-render with current search filter (no rescan)."""
+        if self._library_games is not None:
+            self._render_library_with_games(self._library_games)
 
     def _load_library_async(self):
         """Show spinner immediately, scan ROM folders in background, render when done."""
@@ -3192,65 +3270,56 @@ class UltimateApp(ctk.CTk):
                             img_path = candidate
                             break
 
-                    # Pre-load cover image here in the background scan thread
-                    # so the main thread never blocks on PIL I/O when rendering.
-                    ctk_img = None
-                    if img_path:
-                        try:
-                            pil = Image.open(img_path)
-                            w_px, h_px = pil.size
-                            ratio = 150 / h_px
-                            ctk_img = ctk.CTkImage(
-                                light_image=pil, dark_image=pil,
-                                size=(max(1, int(w_px * ratio)), 150)
-                            )
-                        except Exception:
-                            pass
-
+                    # Don't pre-load images here — defer to render time
+                    # for much faster initial scan.  Store path only.
                     found_consoles.add(console_name)
                     games.append({
                         'name': base_name, 'path': fpath,
                         'console': console_name, 'cover': img_path,
-                        'ctk_img': ctk_img,
+                        'ctk_img': None,
                     })
 
         current_sort = self.lib_sort_var.get()
         sorted_consoles = sorted(found_consoles)
+        # Build per-console game counts for tab badges
+        game_counts = {}
+        for g in games:
+            game_counts[g['console']] = game_counts.get(g['console'], 0) + 1
         # Safe to call from background thread — schedule on main thread
-        self.after(0, lambda sc=sorted_consoles, cs=current_sort:
-            self._build_lib_tabs(sc, cs))
+        self.after(0, lambda sc=sorted_consoles, cs=current_sort, gc=game_counts:
+            self._build_lib_tabs(sc, cs, gc))
         return games
 
-    def _build_lib_tabs(self, sorted_consoles, current_sort: str):
-        """Rebuild the horizontal system tab bar. Called on the main thread."""
+    def _build_lib_tabs(self, sorted_consoles, current_sort: str,
+                        game_counts: dict | None = None):
+        """Rebuild the horizontal system tab bar with short names and counts."""
         for w in self.lib_tab_frame.winfo_children():
             try:
                 w.destroy()
             except Exception:
                 pass
-        # Ensure "All" is always first
+        counts = game_counts or {}
+        total = sum(counts.values()) if counts else 0
         tabs = ['All'] + [c for c in sorted_consoles if c != 'All']
         for label in tabs:
+            short = SHORT_NAMES.get(label, label) if label != 'All' else 'All'
+            count = total if label == 'All' else counts.get(label, 0)
+            display = f"{short}  {count}" if count else short
             is_active = label == current_sort
             btn = ctk.CTkButton(
-                self.lib_tab_frame, text=label,
+                self.lib_tab_frame, text=display,
                 fg_color=C['cyan'] if is_active else C['card'],
                 text_color='black' if is_active else 'white',
                 hover_color=C['pink'],
-                height=28, corner_radius=6, font=('Arial', 11),
+                height=26, corner_radius=13, font=('Arial', 11, 'bold'),
                 command=lambda c=label: self._on_lib_tab_click(c)
             )
-            btn.pack(side='left', padx=3, pady=3)
+            btn.pack(side='left', padx=2, pady=2)
 
     def _on_lib_tab_click(self, console: str):
         """Switch the library view to the selected system tab without rescanning."""
         self.lib_sort_var.set(console)
         if self._library_games is not None:
-            # Re-render using the cache — no filesystem scan needed
-            self._build_lib_tabs(
-                sorted({g['console'] for g in self._library_games}),
-                console
-            )
             self._render_library_with_games(self._library_games)
         else:
             self._load_library_async()
@@ -3263,7 +3332,8 @@ class UltimateApp(ctk.CTk):
             self._load_library_async()
 
     def _render_library_with_games(self, games):
-        """Called on the main thread with pre-scanned, pre-loaded game data."""
+        """Called on the main thread with pre-scanned game data.
+        Renders a tight, responsive grid with lazy image loading."""
         for w in self.library_widgets:
             try:
                 w.destroy()
@@ -3271,70 +3341,124 @@ class UltimateApp(ctk.CTk):
                 pass
         self.library_widgets = []
 
+        # -- Apply console filter
         filter_console = self.lib_sort_var.get()
         filtered = [
             g for g in games
             if filter_console == "All" or g['console'] == filter_console
         ]
+
+        # -- Apply search filter
+        query = self._lib_search_var.get().strip().lower()
+        if query:
+            filtered = [g for g in filtered if query in g['name'].lower()]
+
+        # -- Rebuild tabs with counts (always from full games list)
+        game_counts = {}
+        for g in games:
+            game_counts[g['console']] = game_counts.get(g['console'], 0) + 1
+        sorted_consoles = sorted(game_counts.keys())
+        self._build_lib_tabs(sorted_consoles, filter_console, game_counts)
+
+        # -- Update count label
+        total = len(games)
+        shown = len(filtered)
+        if query:
+            self._lib_count_lbl.configure(
+                text=f"Showing {shown} of {total} games  •  Search: \"{query}\"")
+        elif filter_console != "All":
+            self._lib_count_lbl.configure(
+                text=f"Showing {shown} {filter_console} games  •  {total} total")
+        else:
+            self._lib_count_lbl.configure(text=f"{total} games across {len(game_counts)} systems")
+
         if not filtered:
+            empty_text = ("No games match your search." if query
+                          else "No games found.\nMap your ROM folders in Settings, then hit ↻ Refresh.")
             lbl = ctk.CTkLabel(
-                self.lib_scroll,
-                text="No games found in your mapped folders.",
+                self.lib_scroll, text=empty_text,
                 font=('Arial', 14), text_color=C['dim']
             )
             lbl.pack(pady=40)
             self.library_widgets.append(lbl)
             return
-        COLUMNS = 4
+
+        # -- Responsive column count: 5 for most screens, 6 on wide
+        COLUMNS = 5
         self.lib_scroll.grid_columnconfigure(tuple(range(COLUMNS)), weight=1)
+        IMG_H = 130  # slightly shorter for tighter look
+
         for i, game in enumerate(filtered):
             row_idx = i // COLUMNS
             col = i % COLUMNS
-            card = ctk.CTkFrame(self.lib_scroll, fg_color=C['bg'])
-            card.grid(row=row_idx, column=col, padx=10, pady=10, sticky='nsew')
+
+            # Card with subtle background
+            card = ctk.CTkFrame(
+                self.lib_scroll, fg_color=C['card'],
+                corner_radius=8
+            )
+            card.grid(row=row_idx, column=col, padx=4, pady=4, sticky='nsew')
             self.library_widgets.append(card)
-            # Use pre-loaded image from background thread; fall back to console icon
-            ctk_img = game.get('ctk_img') or self.console_icons.get(game['console'])
+
+            # Lazy-load cover image on first render
+            ctk_img = game.get('ctk_img')
+            if not ctk_img and game.get('cover'):
+                try:
+                    pil = Image.open(game['cover'])
+                    w_px, h_px = pil.size
+                    ratio = IMG_H / h_px
+                    ctk_img = ctk.CTkImage(
+                        light_image=pil, dark_image=pil,
+                        size=(max(1, int(w_px * ratio)), IMG_H)
+                    )
+                    game['ctk_img'] = ctk_img  # cache for next render
+                except Exception:
+                    pass
+            if not ctk_img:
+                ctk_img = self.console_icons.get(game['console'])
+
+            # Clean up display name: strip region tags, truncate nicely
             raw_name = game['name']
-            if len(raw_name) > 36:
-                mid = raw_name[:18].rfind(' ')
-                if mid < 8:
-                    mid = 18
-                line1 = raw_name[:mid].rstrip()
-                line2 = raw_name[mid:mid + 18].strip()
-                if len(raw_name) > mid + 18:
-                    line2 = line2.rstrip()[:15].rstrip() + '...'
-                display_name = f"\n{line1}\n{line2}"
-            elif len(raw_name) > 18:
-                mid = raw_name[:18].rfind(' ')
-                if mid < 8:
-                    mid = 18
-                line1 = raw_name[:mid].rstrip()
-                line2 = raw_name[mid:].strip()
-                display_name = f"\n{line1}\n{line2}"
+            clean = raw_name.split('(')[0].split('[')[0].strip()
+            if len(clean) > 28:
+                display_name = clean[:25].rstrip() + '...'
             else:
-                display_name = f"\n{raw_name}"
+                display_name = clean
+
+            # Console badge for "All" view
+            badge = SHORT_NAMES.get(game['console'], game['console'])
+
             btn = ctk.CTkButton(
                 card, text=display_name,
                 image=ctk_img, compound='top',
-                fg_color='transparent', hover_color=C['card'],
-                text_color='white', font=('Arial', 11),
+                fg_color='transparent', hover_color=C['bg'],
+                text_color='white', font=('Arial', 10),
+                anchor='center', height=IMG_H + 40,
                 command=lambda g=game: self.show_game_details(g)
             )
-            btn.pack(fill='both', expand=True, padx=5, pady=5)
-            clean_name = game['name'].split('(')[0].split('[')[0].strip()
-            btn.bind("<Enter>", lambda e, n=clean_name: self.on_hover_enter(e, n))
+            btn.pack(fill='both', expand=True, padx=3, pady=(3, 0))
+            btn.bind("<Enter>", lambda e, n=clean: self.on_hover_enter(e, n))
             btn.bind("<Leave>", self.on_hover_leave)
+
+            # Bottom row: console badge (in "All" view) + scrape button if needed
+            bottom = ctk.CTkFrame(card, fg_color='transparent', height=20)
+            bottom.pack(fill='x', padx=3, pady=(0, 3))
+
+            if filter_console == "All":
+                ctk.CTkLabel(
+                    bottom, text=badge,
+                    font=('Arial', 9, 'bold'), text_color=C['cyan'],
+                    fg_color=C['bg'], corner_radius=4, width=36, height=16
+                ).pack(side='left', padx=1)
 
             if not game.get('cover'):
                 scrape_btn = ctk.CTkButton(
-                    card, text="🎨 Scrape Art",
-                    height=22, fg_color=C['card'],
-                    hover_color=C['cyan'], text_color=C['dim'],
-                    font=('Arial', 10),
+                    bottom, text="🎨", width=28, height=16,
+                    fg_color=C['bg'], hover_color=C['cyan'],
+                    text_color=C['dim'], font=('Arial', 9),
                     command=lambda g=game, c=card: self._scrape_single_and_refresh(g, c)
                 )
-                scrape_btn.pack(fill='x', padx=5, pady=(0, 5))
+                scrape_btn.pack(side='right', padx=1)
                 self.library_widgets.append(scrape_btn)
 
     def scrape_missing_art(self):
@@ -3416,7 +3540,9 @@ class UltimateApp(ctk.CTk):
         ss_pass = str(self.folder_mappings.get('ss_password', '')).strip()
         if not ss_user or not ss_pass:
             return None
-        return ScreenScraperManager(ss_user, ss_pass)
+        dev_id = str(self.folder_mappings.get('ss_devid', '')).strip()
+        dev_pass = str(self.folder_mappings.get('ss_devpassword', '')).strip()
+        return ScreenScraperManager(ss_user, ss_pass, dev_id, dev_pass)
 
     def scrape_game_art(self, game, done_cb=None):
         """
@@ -3438,19 +3564,29 @@ class UltimateApp(ctk.CTk):
             )
             return
 
-        rom_dir = os.path.dirname(game.get('path', ''))
+        rom_path = game.get('path', '')
+        rom_dir = os.path.dirname(rom_path)
+
+        # Guard: prevent duplicate scrapes for the same file
+        if rom_path in self._scraping_paths:
+            return
+        self._scraping_paths.add(rom_path)
+
         config = self.folder_mappings
 
         def _fetch():
-            meta = ss.scrape_game(game, rom_dir, config, log_cb=self._debug_log)
-            success = bool(
-                meta.get('image') or meta.get('thumbnail') or meta.get('desc')
-            )
-            if success and meta.get('thumbnail'):
-                game['cover'] = meta['thumbnail']
-            if success:
-                self._writeback_scraped_meta(game, rom_dir, meta)
-            self.after(0, lambda: done_cb and done_cb(success))
+            try:
+                meta = ss.scrape_game(game, rom_dir, config, log_cb=self._debug_log)
+                success = bool(
+                    meta.get('image') or meta.get('thumbnail') or meta.get('desc')
+                )
+                if success and meta.get('thumbnail'):
+                    game['cover'] = meta['thumbnail']
+                if success:
+                    self._writeback_scraped_meta(game, rom_dir, meta)
+                self.after(0, lambda: done_cb and done_cb(success))
+            finally:
+                self._scraping_paths.discard(rom_path)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -3541,24 +3677,33 @@ class UltimateApp(ctk.CTk):
 
     def _scrape_single_and_refresh(self, game, card):
         """Scrape art for one game card and refresh the library on completion."""
+        # Find and disable the scrape button to prevent double-clicks
+        scrape_btn = None
         for w in card.winfo_children():
-            if isinstance(w, ctk.CTkButton) and 'Scrape' in (w.cget('text') or ''):
-                w.configure(text="Scraping...", state='disabled')
+            for child in w.winfo_children() if hasattr(w, 'winfo_children') else []:
+                if isinstance(child, ctk.CTkButton) and '🎨' in (child.cget('text') or ''):
+                    scrape_btn = child
+                    break
+            if isinstance(w, ctk.CTkButton) and '🎨' in (w.cget('text') or ''):
+                scrape_btn = w
                 break
+        if scrape_btn:
+            scrape_btn.configure(text="...", state='disabled')
 
         def _done(success):
             if success:
+                # Clear cached image so it reloads on next render
+                game['ctk_img'] = None
                 self.render_library_grid()
             else:
-                for w in card.winfo_children():
-                    if isinstance(w, ctk.CTkButton) and 'Scraping' in (w.cget('text') or ''):
-                        w.configure(text="Not found", state='disabled',
-                                    text_color=C['pink'])
-                        self.after(2000, lambda btn=w: btn.configure(
-                            text="🎨 Scrape Art", state='normal',
-                            text_color=C['dim']
+                if scrape_btn:
+                    try:
+                        scrape_btn.configure(text="✗", text_color=C['pink'])
+                        self.after(2000, lambda: scrape_btn.configure(
+                            text="🎨", state='normal', text_color=C['dim']
                         ))
-                        break
+                    except Exception:
+                        pass
 
         self.scrape_game_art(game, done_cb=_done)
 
@@ -3608,6 +3753,10 @@ class UltimateApp(ctk.CTk):
 
     def show_tooltip_window(self, title, details):
         if not details:
+            return
+        # Don't show tooltip if we've navigated away from library/details
+        if not self.frame_library.winfo_ismapped() and \
+           not self.frame_details.winfo_ismapped():
             return
         x, y = self.winfo_pointerx(), self.winfo_pointery()
         if self.tooltip_window:
@@ -3928,13 +4077,15 @@ class UltimateApp(ctk.CTk):
             font=('Arial', 11), text_color=C['dim'], justify='left'
         ).pack(fill='x', padx=10, pady=(0, 6))
         for label, attr, key, show in [
-            ("Username:", 'entry_ss_user',     'ss_user',     ''),
-            ("Password:", 'entry_ss_password', 'ss_password', '*'),
+            ("Username:",    'entry_ss_user',        'ss_user',        ''),
+            ("Password:",    'entry_ss_password',    'ss_password',    '*'),
+            ("Dev ID:",      'entry_ss_devid',       'ss_devid',       ''),
+            ("Dev Password:", 'entry_ss_devpassword', 'ss_devpassword', '*'),
         ]:
             r = ctk.CTkFrame(self.settings_scroll, fg_color='transparent')
             r.pack(fill='x', pady=2)
             self.settings_widgets.append(r)
-            ctk.CTkLabel(r, text=label, width=100, anchor='w').pack(
+            ctk.CTkLabel(r, text=label, width=120, anchor='w').pack(
                 side='left', padx=10
             )
             entry = ctk.CTkEntry(
@@ -3943,6 +4094,12 @@ class UltimateApp(ctk.CTk):
             entry.insert(0, self.folder_mappings.get(key, ''))
             entry.pack(side='left', fill='x', expand=True, padx=10)
             setattr(self, attr, entry)
+        ctk.CTkLabel(
+            self.settings_scroll,
+            text="Dev ID/Password are optional. Get them by registering your app at\n"
+                 "screenscraper.fr/forumsujet.php. If blank, your user creds are used for both.",
+            font=('Arial', 10), text_color=C['dim'], justify='left'
+        ).pack(fill='x', padx=10, pady=(2, 4))
 
         btn_ss = ctk.CTkButton(
             self.settings_scroll,
@@ -4281,24 +4438,36 @@ class UltimateApp(ctk.CTk):
     def save_ss_creds(self):
         ss_user = self.entry_ss_user.get().strip()
         ss_pass = self.entry_ss_password.get().strip()
+        dev_id = (self.entry_ss_devid.get().strip()
+                  if hasattr(self, 'entry_ss_devid') else '')
+        dev_pass = (self.entry_ss_devpassword.get().strip()
+                    if hasattr(self, 'entry_ss_devpassword') else '')
         self.folder_mappings['ss_user'] = ss_user
         self.folder_mappings['ss_password'] = ss_pass
+        self.folder_mappings['ss_devid'] = dev_id
+        self.folder_mappings['ss_devpassword'] = dev_pass
         self.save_config()
         if ss_user and ss_pass:
             # Quick connectivity test
             def _test():
                 try:
-                    ss = ScreenScraperManager(ss_user, ss_pass)
-                    # Lightweight call — just check the user info endpoint
+                    ss = ScreenScraperManager(ss_user, ss_pass, dev_id, dev_pass)
                     r = ss._session.get(
-                        'https://www.screenscraper.fr/api2/ssuserInfos.php',
+                        ScreenScraperManager.SS_USER_API,
                         params=ss._base_params(), timeout=10
                     )
-                    ok = r.status_code == 200
-                    msg = "ScreenScraper credentials saved and verified ✔" if ok else \
-                          "Credentials saved, but could not verify (check username/password)."
-                    self.after(0, lambda: CustomPopup(
-                        self, "ScreenScraper", msg, ["OK"]
+                    if r.status_code == 200:
+                        msg = "ScreenScraper credentials saved and verified ✔"
+                    elif r.status_code == 403:
+                        msg = ("Credentials saved, but got 403 Forbidden.\n"
+                               "Check your developer ID & password are correct.\n"
+                               "If you don't have dev credentials, leave those "
+                               "fields blank and use your SS username/password only.")
+                    else:
+                        msg = (f"Credentials saved, but got HTTP {r.status_code}.\n"
+                               "Check your username and password.")
+                    self.after(0, lambda m=msg: CustomPopup(
+                        self, "ScreenScraper", m, ["OK"]
                     ))
                 except Exception as e:
                     self.after(0, lambda err=str(e): CustomPopup(
@@ -5027,7 +5196,7 @@ class UltimateApp(ctk.CTk):
         explicit = self.folder_mappings.get(remote_path)
         if explicit:
             return explicit
-        rb_path = self.folder_mappings.get('retrobat_path', '').strip()
+        rb_path = self.folder_mappings.get('retrobat_path', r'C:\retrobat').strip()
         if not rb_path:
             return None
         for console_name, myrient_path in CONSOLES.items():
@@ -5246,7 +5415,12 @@ class UltimateApp(ctk.CTk):
         for w in self.queue_widgets:
             w.destroy()
         self.queue_widgets = []
-        if not self.download_list and not self.pending_stage_queue:
+
+        active_count = len(self.download_list)
+        pending_count = len(self.pending_stage_queue)
+        total = active_count + pending_count
+
+        if total == 0:
             lbl = ctk.CTkLabel(
                 self.queue_list_frame, text="Queue is empty",
                 text_color=C['dim']
@@ -5254,24 +5428,89 @@ class UltimateApp(ctk.CTk):
             lbl.pack(pady=10)
             self.queue_widgets.append(lbl)
             return
+
+        # Search filter
+        query = (self._queue_search_var.get().strip().lower()
+                 if hasattr(self, '_queue_search_var') else '')
+
+        # --- Active batch (download_list) ---
+        if active_count > 0:
+            hdr = ctk.CTkLabel(
+                self.queue_list_frame,
+                text=f"ACTIVE BATCH  ({active_count})",
+                font=('Arial', 11, 'bold'), text_color=C['cyan'], anchor='w'
+            )
+            hdr.pack(fill='x', padx=8, pady=(6, 2))
+            self.queue_widgets.append(hdr)
+
         for i, item in enumerate(self.download_list):
+            if query and query not in item['name'].lower():
+                continue
             row = ctk.CTkFrame(self.queue_list_frame, fg_color='transparent')
-            row.pack(fill='x', pady=2)
+            row.pack(fill='x', pady=1)
             self.queue_widgets.append(row)
             self.bind_scroll(row, self.queue_list_frame)
+            size_str = f"  ({item['size_mb']:.0f} MB)" if item.get('size_mb') else ""
             ctk.CTkLabel(
-                row, text=f"{i+1}. {item['name']}",
-                anchor='w', text_color='white'
+                row, text=f"  {i+1}. {item['name']}{size_str}",
+                anchor='w', text_color='white', font=('Arial', 11)
             ).pack(side='left', padx=5, fill='x', expand=True)
             ctk.CTkButton(
-                row, text="❌", width=30,
+                row, text="❌", width=28, height=22,
                 fg_color=C['bg'], hover_color=C['pink'],
                 command=lambda idx=i: self.remove_from_queue(idx)
             ).pack(side='right', padx=5)
 
+        # --- Pending queue (pending_stage_queue) ---
+        if pending_count > 0:
+            hdr2 = ctk.CTkLabel(
+                self.queue_list_frame,
+                text=f"PENDING  ({pending_count} items, loads in batches of 100)",
+                font=('Arial', 11, 'bold'), text_color=C['dim'], anchor='w'
+            )
+            hdr2.pack(fill='x', padx=8, pady=(10, 2))
+            self.queue_widgets.append(hdr2)
+
+            # Show first 50 pending items (don't render thousands)
+            shown = 0
+            for item in self.pending_stage_queue:
+                if shown >= 50:
+                    break
+                if query and query not in item['name'].lower():
+                    continue
+                row = ctk.CTkFrame(self.queue_list_frame, fg_color='transparent')
+                row.pack(fill='x', pady=1)
+                self.queue_widgets.append(row)
+                self.bind_scroll(row, self.queue_list_frame)
+                size_str = f"  ({item['size_mb']:.0f} MB)" if item.get('size_mb') else ""
+                ctk.CTkLabel(
+                    row, text=f"  {item['name']}{size_str}",
+                    anchor='w', text_color=C['dim'], font=('Arial', 11)
+                ).pack(side='left', padx=5, fill='x', expand=True)
+                shown += 1
+
+            if pending_count > 50:
+                more = ctk.CTkLabel(
+                    self.queue_list_frame,
+                    text=f"  ... and {pending_count - 50} more",
+                    text_color=C['dim'], font=('Arial', 10, 'italic')
+                )
+                more.pack(fill='x', padx=8, pady=(2, 4))
+                self.queue_widgets.append(more)
+
     def log(self, msg):
-        self.log_box.insert('end', msg + "\n")
-        self.log_box.see('end')
+        """Thread-safe log to the queue log box. Can be called from any thread."""
+        def _do():
+            try:
+                self.log_box.insert('end', msg + "\n")
+                self.log_box.see('end')
+            except Exception:
+                pass  # widget may be destroyed
+        # If called from main thread, execute directly; otherwise schedule
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
 
     def play_notification(self):
         if not self.folder_mappings.get('notif_sound', True):
@@ -5781,16 +6020,18 @@ def teknoparrot_post_process(zip_path: str, dest_dir: str, log_cb=None):
         os.makedirs(extract_dir, exist_ok=True)
         real_extract_dir = os.path.realpath(extract_dir)
         with zipfile.ZipFile(zip_path, 'r') as zf:
+            safe_members = []
             for member in zf.infolist():
                 member_dest = os.path.realpath(
                     os.path.join(extract_dir, member.filename)
                 )
-                # Zip-slip guard
+                # Zip-slip guard — only extract members inside target dir
                 if not member_dest.startswith(real_extract_dir + os.sep) and \
                         member_dest != real_extract_dir:
                     log(f'WARN: Skipping unsafe zip path: {member.filename!r}')
                     continue
-            zf.extractall(extract_dir)
+                safe_members.append(member)
+            zf.extractall(extract_dir, members=safe_members)
         log(f'Extraction complete: {extract_dir}')
     except Exception as e:
         log(f'ERROR: Extraction failed: {type(e).__name__}: {e}')
