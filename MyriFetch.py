@@ -3150,7 +3150,7 @@ class UltimateApp(ctk.CTk):
 
         # FIXED: only iterate known console paths, not all config keys
         for remote_path in CONSOLES.values():
-            local_path = self.folder_mappings.get(remote_path)
+            local_path = self._derive_console_path(remote_path)
             if not local_path or not isinstance(local_path, str):
                 continue
             if not os.path.exists(local_path):
@@ -5016,8 +5016,29 @@ class UltimateApp(ctk.CTk):
             else:
                 self.refresh_dir('/'.join(parts[:-1]) + '/')
 
+    def _derive_console_path(self, remote_path: str) -> str | None:
+        """Return the local folder for a Myrient remote_path.
+
+        Priority:
+          1. Explicit mapping saved in folder_mappings
+          2. RetroBat-derived path: <retrobat_path>/roms/<rb_folder>
+             (works even if the folder doesn't exist yet — downloads create it)
+        """
+        explicit = self.folder_mappings.get(remote_path)
+        if explicit:
+            return explicit
+        rb_path = self.folder_mappings.get('retrobat_path', '').strip()
+        if not rb_path:
+            return None
+        for console_name, myrient_path in CONSOLES.items():
+            if myrient_path == remote_path:
+                rb_folder = RETROBAT_ROM_FOLDERS.get(console_name)
+                if rb_folder:
+                    return os.path.join(rb_path, 'roms', rb_folder)
+        return None
+
     def get_local_folder(self):
-        return self.folder_mappings.get(self.current_path)
+        return self._derive_console_path(self.current_path)
 
     def update_map_btn(self):
         path = self.get_local_folder()
