@@ -1572,25 +1572,46 @@ class ScreenScraperManager:
                  dev_id: str = '', dev_password: str = ''):
         self.ss_user = ss_user
         self.ss_password = ss_password
-        # Developer credentials — separate from user creds per SS API spec.
-        # If not provided, falls back to user creds (works for users who have
-        # registered their own dev account).
-        self.dev_id = dev_id or ss_user
-        self.dev_password = dev_password or ss_password
+        self.dev_id = dev_id
+        self.dev_password = dev_password
         self._session = requests.Session()
         self._session.headers.update({
             'User-Agent': f'MyriFetch/{APP_NAME}',
         })
+        # Rate-limit: track last request time (min 1.2s between calls)
+        self._last_request_time = 0.0
+        # Collect all secret values for scrubbing log output
+        self._secrets = [v for v in (ss_user, ss_password, dev_id, dev_password) if v]
+
+    def _scrub(self, text: str) -> str:
+        """Remove all credential values from a string before logging."""
+        for secret in self._secrets:
+            text = text.replace(secret, '***')
+            # Also replace URL-encoded forms
+            text = text.replace(quote(secret, safe=''), '***')
+        return text
+
+    def _rate_limit(self):
+        """Enforce minimum delay between API requests."""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < 1.2:
+            time.sleep(1.2 - elapsed)
+        self._last_request_time = time.time()
 
     def _base_params(self):
-        return {
-            'devid':       self.dev_id,
-            'devpassword': self.dev_password,
+        p = {
             'softname':    self.SOFTNAME,
             'output':      'json',
             'ssid':        self.ss_user,
             'sspassword':  self.ss_password,
         }
+        # Only include dev creds if explicitly provided
+        if self.dev_id:
+            p['devid'] = self.dev_id
+        if self.dev_password:
+            p['devpassword'] = self.dev_password
+        return p
 
     def lookup_game(self, rom_name: str, system_id: int, log_cb=None):
         """
@@ -1608,29 +1629,37 @@ class ScreenScraperManager:
         params['systemeid'] = str(system_id)
         params['romnom'] = rom_name
 
-        # Sanitised URL for logging (no passwords or usernames)
-        safe_params = {k: v for k, v in params.items()
-                       if k not in ('devpassword', 'sspassword', 'devid', 'ssid')}
         log(f'ScreenScraper → GET systemeid={params["systemeid"]} romnom={params["romnom"]!r}')
-        log(f'  params (sanitised): {safe_params}')
+        self._rate_limit()
         try:
             r = self._session.get(
                 self.SS_API, params=params, timeout=20
             )
             log(f'  HTTP {r.status_code}')
+            if r.status_code == 403:
+                log('  403 Forbidden — check your ScreenScraper credentials.')
+                if not self.dev_id:
+                    log('  No developer credentials configured. '
+                        'Dev creds are required — register at screenscraper.fr')
+                return None
+            if r.status_code == 429:
+                log('  429 Too Many Requests — rate limited. Waiting 5s...')
+                time.sleep(5)
+                return None
+            if r.status_code == 430:
+                log('  430 — daily scrape quota exceeded for your account.')
+                return None
+            if r.status_code == 431:
+                log('  431 — too many unrecognised ROMs today.')
+                return None
             r.raise_for_status()
             data = r.json()
+        except requests.exceptions.HTTPError as e:
+            log(f'ScreenScraper API error: HTTP {self._scrub(str(e))}')
+            return None
         except Exception as e:
-            # Sanitise error messages — strip credentials from URLs
-            err_msg = str(e)
-            tb_msg = traceback.format_exc()
-            for secret_key in ('devpassword', 'sspassword', 'devid', 'ssid'):
-                secret_val = params.get(secret_key, '')
-                if secret_val:
-                    err_msg = err_msg.replace(secret_val, '***')
-                    tb_msg = tb_msg.replace(secret_val, '***')
-            log(f'ScreenScraper API error: {type(e).__name__}: {err_msg}')
-            log(tb_msg)
+            log(f'ScreenScraper API error: {type(e).__name__}: {self._scrub(str(e))}')
+            log(self._scrub(traceback.format_exc()))
             return None
 
         header = data.get('header', {})
@@ -1697,8 +1726,8 @@ class ScreenScraperManager:
             log(f'Saved: {dest_path}')
             return True
         except Exception as e:
-            log(f'Media download failed ({_safe_url}): {type(e).__name__}: {e}')
-            log(traceback.format_exc())
+            log(f'Media download failed: {type(e).__name__}: {self._scrub(str(e))}')
+            log(self._scrub(traceback.format_exc()))
             return False
 
     def scrape_game(
@@ -3522,8 +3551,10 @@ class UltimateApp(ctk.CTk):
 
         def _run():
             for game in missing:
-                time.sleep(0.3)
+                if self._cancel_event.is_set():
+                    break
                 self.scrape_game_art(game, done_cb=_on_done)
+                time.sleep(1.5)  # respect SS rate limits
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3677,18 +3708,25 @@ class UltimateApp(ctk.CTk):
 
     def _scrape_single_and_refresh(self, game, card):
         """Scrape art for one game card and refresh the library on completion."""
-        # Find and disable the scrape button to prevent double-clicks
+        # Guard: if already scraping this path, ignore the click
+        rom_path = game.get('path', '')
+        if rom_path in self._scraping_paths:
+            return
+
+        # Disable all buttons in the card to prevent double-clicks
         scrape_btn = None
         for w in card.winfo_children():
-            for child in w.winfo_children() if hasattr(w, 'winfo_children') else []:
-                if isinstance(child, ctk.CTkButton) and '🎨' in (child.cget('text') or ''):
-                    scrape_btn = child
-                    break
+            if isinstance(w, ctk.CTkFrame):
+                for child in w.winfo_children():
+                    if isinstance(child, ctk.CTkButton):
+                        child.configure(state='disabled')
+                        if '🎨' in (child.cget('text') or ''):
+                            scrape_btn = child
             if isinstance(w, ctk.CTkButton) and '🎨' in (w.cget('text') or ''):
                 scrape_btn = w
-                break
+                w.configure(state='disabled')
         if scrape_btn:
-            scrape_btn.configure(text="...", state='disabled')
+            scrape_btn.configure(text="...")
 
         def _done(success):
             if success:
@@ -5685,6 +5723,8 @@ class UltimateApp(ctk.CTk):
             return final_path
 
     def process_queue(self):
+        if self.is_downloading:
+            return  # already running — don't spawn a second worker
         self.is_downloading = True
         self._cancel_event.clear()
         self._pause_event.set()  # start running (not paused)
@@ -5698,6 +5738,32 @@ class UltimateApp(ctk.CTk):
             state='normal', text='Stop Download'
         ))
 
+        try:
+          self._process_queue_loop()
+        except Exception as e:
+          self.log(f"QUEUE WORKER CRASHED: {e}")
+          traceback.print_exc()
+        finally:
+          self._finish_queue()
+
+    def _finish_queue(self):
+        """Clean up after queue processing ends (success, cancel, or crash)."""
+        self.is_downloading = False
+        self._cancel_event.clear()
+        self._pause_event.set()
+        self.after(0, lambda: self.btn_pause.configure(
+            state='disabled', text='Pause Download',
+            fg_color=C['card'], text_color='white'
+        ))
+        self.after(0, lambda: self.btn_stop.configure(
+            state='disabled', text='Stop Download'
+        ))
+        self.after(0, lambda: self.progress_bar.set(0))
+        self.after(0, lambda: self.lbl_speed.configure(text="IDLE"))
+        self.update_batch_labels()
+        self.net_log("Idle")
+
+    def _process_queue_loop(self):
         while (self.download_list or self.pending_stage_queue) and not self._cancel_event.is_set():
             if not self.download_list and self.pending_stage_queue:
                 self.log("📦 LOADING NEXT BATCH (100 items)...")
@@ -5898,22 +5964,7 @@ class UltimateApp(ctk.CTk):
                 self.log(f"CRITICAL ERROR: {e}")
                 traceback.print_exc()
 
-        self.is_downloading = False
-        self._cancel_event.clear()
-        self._pause_event.set()
-
-        # FIXED: all UI updates through after()
-        self.after(0, lambda: self.btn_pause.configure(
-            state='disabled', text='Pause Download',
-            fg_color=C['card'], text_color='white'
-        ))
-        self.after(0, lambda: self.btn_stop.configure(
-            state='disabled', text='Stop Download'
-        ))
-        self.after(0, lambda: self.progress_bar.set(0))
-        self.after(0, lambda: self.lbl_speed.configure(text="IDLE"))
-        self.update_batch_labels()
-        self.net_log("Idle")
+        # Cleanup is handled by _finish_queue() in the finally block
 
 
 # ---------------------------------------------------------------------------
