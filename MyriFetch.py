@@ -5139,16 +5139,11 @@ class UltimateApp(ctk.CTk):
             final_path = self.apply_folder_structure(local_dir, self.current_path)
             local_dir = final_path
             if self.current_path:
-                ask = CustomPopup(
-                    self, "Save Location?",
-                    f"Save this as the default folder?\n\n{final_path}",
-                    ["Yes", "No"]
-                )
-                if ask.result == "Yes":
-                    self.folder_mappings[self.current_path] = final_path
-                    self.save_config()
-                    self.update_map_btn()
-                    self.update_storage_stats()
+                # Always persist the mapping so the library can find the files
+                self.folder_mappings[self.current_path] = final_path
+                self.save_config()
+                self.update_map_btn()
+                self.update_storage_stats()
 
         if not os.path.exists(local_dir):
             try:
